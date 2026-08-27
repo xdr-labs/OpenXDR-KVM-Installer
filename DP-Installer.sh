@@ -12560,7 +12560,7 @@ step_13_install_dp_cli() {
     local dialog_height dialog_width
     read -r dialog_height dialog_width <<< "${dialog_dims}"
     local centered_msg
-    centered_msg=$(center_message "Install DP Appliance CLI package (dp_cli) on the host\nand apply it to the stellar user.\n\n(Will download latest version from GitHub: https://github.com/RickLee-kr/Stellar-appliance-cli)\n\nDo you want to continue?")
+    centered_msg=$(center_message "Install DP Appliance CLI package (dp_cli) on the host\nand apply it to the stellar user.\n\n(Will download latest version from GitHub: https://github.com/xdr-labs/Stellar-appliance-cli)\n\nDo you want to continue?")
     
     if ! whiptail --title "STEP 13 Execution Confirmation" \
                   --yesno "${centered_msg}" "${dialog_height}" "${dialog_width}"
@@ -12647,7 +12647,7 @@ step_13_install_dp_cli() {
     fi
 
     # 1) Download dp_cli from GitHub
-    local GITHUB_REPO="https://github.com/RickLee-kr/Stellar-appliance-cli"
+    local GITHUB_REPO="https://github.com/xdr-labs/Stellar-appliance-cli"
     local DOWNLOAD_URL="${GITHUB_REPO}/archive/refs/heads/main.zip"
     local TEMP_DIR="/tmp/dp_cli_download"
     local ZIP_FILE="${TEMP_DIR}/Stellar-appliance-cli-main.zip"

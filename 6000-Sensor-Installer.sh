@@ -4095,7 +4095,7 @@ step_10_install_dp_cli() {
         load_config || true
     fi
 
-    if ! whiptail_yesno "STEP 10 Execution Check" "Install DP Appliance CLI package (dp_cli) and apply to stellar user.\n\n(Will download latest version from GitHub: https://github.com/RickLee-kr/Stellar-appliance-cli)\n\nDo you want to continue?" 15 85
+    if ! whiptail_yesno "STEP 10 Execution Check" "Install DP Appliance CLI package (dp_cli) and apply to stellar user.\n\n(Will download latest version from GitHub: https://github.com/xdr-labs/Stellar-appliance-cli)\n\nDo you want to continue?" 15 85
     then
         log "User canceled STEP 10 execution."
         return 0
@@ -4179,7 +4179,7 @@ step_10_install_dp_cli() {
     fi
 
     # 1) Download dp_cli from GitHub
-    local GITHUB_REPO="https://github.com/RickLee-kr/Stellar-appliance-cli"
+    local GITHUB_REPO="https://github.com/xdr-labs/Stellar-appliance-cli"
     local DOWNLOAD_URL="${GITHUB_REPO}/archive/refs/heads/main.zip"
     local TEMP_DIR="/tmp/dp_cli_download"
     local ZIP_FILE="${TEMP_DIR}/Stellar-appliance-cli-main.zip"

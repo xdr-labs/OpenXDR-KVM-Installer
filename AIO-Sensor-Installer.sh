@@ -9933,7 +9933,7 @@ step_13_install_dp_cli() {
         load_config || true
     fi
 
-    if ! whiptail_yesno "STEP 13 Execution Confirmation" "Install DP Appliance CLI (dp_cli) on the host and apply to the stellar user.\n\n📦 Source: https://github.com/RickLee-kr/Stellar-appliance-cli\n\nProceed with installation?" 15 85
+    if ! whiptail_yesno "STEP 13 Execution Confirmation" "Install DP Appliance CLI (dp_cli) on the host and apply to the stellar user.\n\n📦 Source: https://github.com/xdr-labs/Stellar-appliance-cli\n\nProceed with installation?" 15 85
     then
         log "User canceled STEP 13 execution."
         return 0
@@ -10017,7 +10017,7 @@ step_13_install_dp_cli() {
     fi
 
     # 1) Download dp_cli from GitHub
-    local GITHUB_REPO="https://github.com/RickLee-kr/Stellar-appliance-cli"
+    local GITHUB_REPO="https://github.com/xdr-labs/Stellar-appliance-cli"
     local DOWNLOAD_URL="${GITHUB_REPO}/archive/refs/heads/main.zip"
     local TEMP_DIR="/tmp/dp_cli_download"
     local ZIP_FILE="${TEMP_DIR}/Stellar-appliance-cli-main.zip"
