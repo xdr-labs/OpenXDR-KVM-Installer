@@ -1,15 +1,105 @@
-# OpenXDR KVM Installer
+<h1 align="center">OpenXDR KVM Installer</h1>
 
-This repository contains automated deployment scripts for Stellar Cyber's OpenXDR Data Processor and Sensor components on KVM (Kernel-based Virtual Machine) hypervisors.
+<p align="center">
+  <strong>Automated KVM deployment for Stellar Cyber OpenXDR Data Processor and Sensor components.</strong>
+</p>
 
-## Overview
+<p align="center">
+  Detect hardware, prepare KVM/libvirt, configure networking and storage, then deploy DP, Sensor, or AIO + Sensor through a guided TUI.
+</p>
 
-These scripts provide an interactive, menu-driven installation process using `whiptail` for a text-based user interface (TUI). They automate the complete setup process for deploying OpenXDR components, including hardware detection, network configuration, KVM setup, and VM deployment.
+<p align="center">
+  <strong>English</strong> · <a href="README.ko.md">한국어</a> · <a href="https://xdr.ooo/products/openxdr-kvm-installer">Product Page</a>
+</p>
 
-The repository includes installers for:
-- **Data Processor (DP)**: Standalone Data Processor deployment
-- **Sensor**: Standalone Sensor deployment (standard or high-performance m6000-style)
-- **AIO + Sensor**: Integrated deployment of both AIO (All-In-One) Data Processor and Sensor components on a single host
+<p align="center">
+  <img src="https://img.shields.io/badge/platform-KVM-2563EB?style=flat-square" alt="KVM">
+  <img src="https://img.shields.io/badge/runtime-libvirt-7C3AED?style=flat-square" alt="libvirt">
+  <img src="https://img.shields.io/badge/host-Ubuntu-E95420?style=flat-square&logo=ubuntu&logoColor=white" alt="Ubuntu">
+  <img src="https://img.shields.io/badge/UI-whiptail%20TUI-16A34A?style=flat-square" alt="whiptail TUI">
+</p>
+
+<p align="center">
+  <strong>Product page:</strong> <a href="https://xdr.ooo/products/openxdr-kvm-installer">xdr.ooo/products/openxdr-kvm-installer</a>
+</p>
+
+---
+
+## Build a repeatable OpenXDR KVM appliance
+
+OpenXDR KVM Installer automates the host-side work required to deploy Stellar Cyber OpenXDR components on KVM hypervisors.
+
+Instead of manually wiring libvirt, LVM, NICs, SR-IOV/PCI passthrough, VM resources, images, and reboot/resume state, the installers expose a guided `whiptail` workflow with explicit configuration and validation.
+
+## Installer families
+
+| Installer | Purpose |
+|---|---|
+| **DP-Installer.sh** | Standalone Data Processor deployment |
+| **Sensor-Installer.sh** | Standard modular Sensor deployment |
+| **6000-Sensor-Installer.sh** | High-performance dual-VM Sensor deployment |
+| **AIO-Sensor-Installer.sh** | Integrated AIO Data Processor + Sensor deployment |
+
+## What it automates
+
+| Area | Automation |
+|---|---|
+| **Hardware** | CPU, memory, disk, NIC, virtualization and IOMMU discovery |
+| **KVM stack** | KVM/libvirt installation and configuration |
+| **Networking** | Management, NAT/bridge, SR-IOV, SPAN and passthrough workflows |
+| **Storage** | LVM-based VM storage preparation |
+| **VM deployment** | Image acquisition, VM definition, resource calculation and deployment |
+| **Performance** | CPU affinity, NUMA-aware placement and PCI passthrough where applicable |
+| **Lifecycle** | Step state, reboot handling and resume |
+| **Safety** | DRY_RUN and configuration validation before destructive execution |
+
+## Architecture
+
+```mermaid
+flowchart TB
+    H["Ubuntu KVM Host"] --> K["KVM / libvirt"]
+    K --> DP["Data Processor<br/>DL / DA or AIO"]
+    K --> S["OpenXDR Sensor"]
+    N["Management / NAT"] --> DP
+    N --> S
+    P["SPAN / SR-IOV / PCI Passthrough"] --> S
+    L["LVM Storage"] --> DP
+    L --> S
+```
+
+## Quick start
+
+Clone the repository:
+
+```bash
+git clone https://github.com/xdr-labs/OpenXDR-KVM-Installer.git
+cd OpenXDR-KVM-Installer
+sudo -i
+```
+
+Choose the installer that matches the deployment:
+
+```bash
+# Standalone Data Processor
+./DP-Installer.sh
+
+# AIO + Sensor
+./AIO-Sensor-Installer.sh
+
+# Standard Sensor
+./Sensor-Installer.sh
+
+# High-performance Sensor
+./6000-Sensor-Installer.sh
+```
+
+Review configuration and keep **DRY_RUN enabled** until hardware, networking, storage, versions, and credentials have been verified.
+
+After an installer-triggered reboot, run the same installer again; state tracking resumes the workflow from the appropriate step.
+
+For the product overview, use **https://xdr.ooo/products/openxdr-kvm-installer**.
+
+---
 
 ## Scripts
 
