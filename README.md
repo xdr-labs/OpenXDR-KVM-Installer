@@ -69,12 +69,12 @@ flowchart TB
 
 ## Quick start
 
-Clone the repository:
+Switch to a root login shell first, then clone the repository:
 
 ```bash
+sudo -i
 git clone https://github.com/xdr-labs/OpenXDR-KVM-Installer.git
 cd OpenXDR-KVM-Installer
-sudo -i
 ```
 
 Choose the installer that matches the deployment:
@@ -269,7 +269,7 @@ Deploys OpenXDR modular sensors on KVM with flexible configuration options.
 1. **Clone or download this repository:**
    ```bash
    git clone <repository-url>
-   cd "OpenXDR KVM Installer"
+   cd OpenXDR-KVM-Installer
    ```
 
 2. **Switch to root user:**
