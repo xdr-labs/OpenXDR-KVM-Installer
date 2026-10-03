@@ -170,7 +170,7 @@ All log entries must follow this structure:
 
 ---
 
-## 11. Anti-Regression Rules (Cursor Guardrails)
+## 11. Anti-Regression Rules (Implementation Guardrails)
 
 The following actions are strictly forbidden without contract revision:
 

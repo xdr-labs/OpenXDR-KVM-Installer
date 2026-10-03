@@ -156,7 +156,7 @@ STEP 10 and STEP 11 are **image consumption stages**, not image acquisition stag
 
 - STEP 09 defines the DP qcow2 image source
 - STEP 10 and STEP 11 must strictly consume that result without modification
-- Cursor must never merge or generalize image download logic across these steps
+- The implementer must never merge or generalize image download logic across these steps
 
 
 ---

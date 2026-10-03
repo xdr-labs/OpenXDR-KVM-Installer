@@ -83,7 +83,7 @@ during future bug fixes or feature enhancements.
 
 ## 6. Mandatory Change Documentation
 
-When modifying code, Cursor must explicitly provide:
+When modifying code, The implementer must explicitly provide:
 - The exact functions or STEPs modified
 - A clear before/after comparison
 - An explanation of why existing stable behavior is not affected
