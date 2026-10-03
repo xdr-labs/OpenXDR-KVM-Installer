@@ -62,3 +62,9 @@ For adoption or managed upgrades, follow `standards/ADOPTION.md`, preserve proje
 Adopted projects pin `engineering_system.version` and an immutable `engineering_system.baseline` SHA in `.engineering/project.yaml`. Managed upgrades must keep that version/baseline identity aligned with the canonical Engineering System release (currently 1.7.0) rather than assuming same-major pins are current.
 
 Tool-specific adapters may change syntax but must not weaken these rules.
+## Project-specific installer invariants
+
+- Preserve the provider-neutral safety and compatibility contracts under `docs/engineering-invariants/`.
+- DRY_RUN must never perform real system changes; destructive operations require explicit warnings and confirmation.
+- Installer STEP ordering/identity, persistent state/config compatibility, Cancel/ESC semantics, image-source decision boundaries, and read-only validation behavior are compatibility contracts.
+- Changes to installer behavior must identify the affected invariant and show backward-compatibility evidence.
