@@ -5,7 +5,7 @@ https://github.com/datarelay-labs/engineering-system
 
 ## XDR owner-assigned direct execution (2026-10-11)
 
-The owner explicitly assigns this \`xdr-labs\` repository's Engineering System adoption,
+The owner explicitly assigns this `xdr-labs` repository's Engineering System adoption,
 implementation, tests and normal Git/PR/CI review **directly to the Engineering System Chat**.
 It must carry out authorized repository work itself, not stop at a roadmap handoff or
 retarget work to a DataRelay product chat. Respect the current owner's instructions,
