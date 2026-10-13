@@ -72,3 +72,25 @@ scenarios:
   - AIO root stays at 545GiB while Sensor fits post-AIO ubuntu-vg free capacity
   - NVMe partition selection, zero-byte virtual disk exclusion, and DRY_RUN remain safe
   release_gate: true
+
+- id: AIO-MDS-NUMA-001
+  cost: cheap
+  estimated_seconds: 8
+  timeout_seconds: 30
+  agent_default: true
+  scope: static
+  name: AIO NUMA0 and MDS NUMA1 CPU/memory regression
+  level: static
+  domains:
+  - core
+  triggers:
+  - affected
+  - pr
+  platforms:
+  - linux
+  command: bash tests/aio-mds-numa-regression.sh
+  invariants:
+  - NUMA range lists resolve to exact online CPU IDs for all VM vCPUs
+  - AIO binds CPU and memory to node0 and MDS to node1 without partial success
+  - DRY_RUN never writes NUMA state and default AIO root LV remains 545GiB
+  release_gate: true

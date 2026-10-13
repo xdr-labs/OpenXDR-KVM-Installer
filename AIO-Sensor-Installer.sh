@@ -570,6 +570,178 @@ get_qcow2_virtual_size_bytes() {
   printf '%s\n' "${virtual_bytes}"
 }
 
+# BEGIN NUMA HELPERS
+# The installer is a standalone file: keep these helpers inline. Parse the
+# machine-readable topology; the human '0-23,48-71' form is not an array.
+numa_expand_cpu_list() {
+  local spec="${1//[[:space:]]/}"
+  [[ -n "${spec}" ]] || return 1
+  awk -v spec="${spec}" 'BEGIN {
+    n=split(spec, chunks, ",")
+    for (i=1; i<=n; i++) {
+      if (chunks[i] !~ /^[0-9]+(-[0-9]+)?$/) exit 1
+      split(chunks[i], bounds, "-")
+      first=bounds[1]+0
+      last=(bounds[2]=="" ? first : bounds[2]+0)
+      if (first>last || last>65535 || last-first>4096) exit 1
+      for (j=first; j<=last; j++) print j
+    }
+  }' | LC_ALL=C sort -nu | paste -sd ',' -
+}
+
+# Return every online physical CPU ID belonging to one NUMA node, as CSV.
+numa_node_cpu_list() {
+  local node="${1:-}" topology="" csv="" cpu_file=""
+  [[ "${node}" =~ ^[0-9]+$ ]] || return 1
+  if command -v lscpu >/dev/null 2>&1; then
+    if topology=$(LC_ALL=C lscpu -p=CPU,NODE,ONLINE 2>/dev/null); then
+      csv=$(printf '%s\n' "${topology}" | awk -F, -v node="${node}" \
+        '$1 ~ /^[0-9]+$/ && $2 == node && toupper($3) ~ /^(Y|YES|1)$/ {print $1}' \
+        | LC_ALL=C sort -nu | paste -sd ',' -)
+      [[ -n "${csv}" ]] || return 1
+      printf '%s\n' "${csv}"
+      return 0
+    fi
+  fi
+  # Fallback only if lscpu itself is unavailable/failed. A successful empty
+  # online-CPU list is not a reason to pin a powered-off CPU from sysfs.
+  cpu_file="${NUMA_SYSFS_ROOT:-/sys/devices/system/node}/node${node}/cpulist"
+  [[ -r "${cpu_file}" ]] || return 1
+  numa_expand_cpu_list "$(cat "${cpu_file}")"
+}
+
+numa_node_count() {
+  local topology="" count=""
+  if command -v lscpu >/dev/null 2>&1; then
+    if topology=$(LC_ALL=C lscpu -p=CPU,NODE,ONLINE 2>/dev/null); then
+      count=$(printf '%s\n' "${topology}" | awk -F, \
+        '$1 ~ /^[0-9]+$/ && $2 ~ /^[0-9]+$/ && toupper($3) ~ /^(Y|YES|1)$/ {seen[$2]=1}
+         END {for (n in seen) c++; print c+0}')
+      if [[ "${count}" =~ ^[0-9]+$ ]] && (( count > 0 )); then
+        printf '%s\n' "${count}"
+        return 0
+      fi
+    fi
+  fi
+  if [[ -d "${NUMA_SYSFS_ROOT:-/sys/devices/system/node}/node1" ]]; then
+    printf '2\n'
+  else
+    printf '1\n'
+  fi
+}
+
+numa_cpu_count() {
+  local csv="${1:-}"
+  [[ "${csv}" =~ ^[0-9]+(,[0-9]+)*$ ]] || return 1
+  awk -F, '{print NF}' <<< "${csv}"
+}
+
+numa_take_cpus() {
+  local csv="${1:-}" requested="${2:-}" i result=""
+  [[ "${csv}" =~ ^[0-9]+(,[0-9]+)*$ && "${requested}" =~ ^[1-9][0-9]*$ ]] || return 1
+  local -a cpus=()
+  IFS=, read -r -a cpus <<< "${csv}"
+  (( requested <= ${#cpus[@]} )) || return 1
+  for ((i=0; i<requested; i++)); do
+    [[ -z "${result}" ]] && result="${cpus[i]}" || result+=",${cpus[i]}"
+  done
+  printf '%s\n' "${result}"
+}
+
+# Permit up to 85% of a single node's RAM for its guest, reserving at least
+# 15% for the host, hypervisor and NUMA-local kernel allocations.
+numa_node_memory_limit_gib() {
+  local node="${1:-}" total_kib="" limit=""
+  [[ "${node}" =~ ^[0-9]+$ ]] || return 1
+  local node_meminfo="${NUMA_SYSFS_ROOT:-/sys/devices/system/node}/node${node}/meminfo"
+  [[ -r "${node_meminfo}" ]] || return 1
+  total_kib=$(awk -v node="${node}" '$1=="Node" && $2==node && $3=="MemTotal:" && $4 ~ /^[0-9]+$/ {print $4; exit}' "${node_meminfo}")
+  [[ "${total_kib}" =~ ^[0-9]+$ ]] || return 1
+  limit=$(( total_kib * 85 / 100 / 1048576 ))
+  (( limit >= 2 )) || return 1
+  printf '%s\n' "${limit}"
+}
+
+numa_validate_guest_request() {
+  local vm="${1:-}" node="${2:-}" vcpus="${3:-}" memory_gib="${4:-}"
+  local cpus="" cpu_count="" memory_limit=""
+  [[ "${vcpus}" =~ ^[1-9][0-9]*$ && "${memory_gib}" =~ ^[1-9][0-9]*$ ]] || {
+    log "[NUMA] Invalid vCPU/memory request for ${vm}: cpu=${vcpus}, memory=${memory_gib}GiB"
+    return 1
+  }
+  cpus=$(numa_node_cpu_list "${node}") || {
+    log "[NUMA] Cannot detect online CPUs on node ${node}; ${vm} binding blocked."
+    return 1
+  }
+  cpu_count=$(numa_cpu_count "${cpus}") || return 1
+  if (( vcpus > cpu_count )); then
+    log "[NUMA] ${vm}: requested ${vcpus} vCPUs exceeds ${cpu_count} online CPUs on node ${node}."
+    return 1
+  fi
+  memory_limit=$(numa_node_memory_limit_gib "${node}") || {
+    log "[NUMA] Cannot determine safe memory capacity on node ${node}; ${vm} binding blocked."
+    return 1
+  }
+  if (( memory_gib > memory_limit )); then
+    log "[NUMA] ${vm}: requested ${memory_gib}GiB exceeds NUMA${node} safe limit ${memory_limit}GiB (85% of local RAM)."
+    return 1
+  fi
+  return 0
+}
+
+# Persistent VM CPU and memory placement; STEP 12 restarts both guests so
+# --config applies to the next VM start. Fail rather than silently only pin
+# some vCPUs or leave the VM without its requested memory-node policy.
+numa_apply_vm_policy() {
+  local vm="${1:-}" node="${2:-}" cpus="" max_vcpus="" used_mem_kib="" memory_gib="" i=""
+  local -a pcpu=()
+  cpus=$(numa_node_cpu_list "${node}") || {
+    log "[NUMA] ${vm}: no online CPU list for node ${node}"
+    return 1
+  }
+  max_vcpus=$(virsh vcpucount "${vm}" --maximum --config 2>/dev/null | awk 'NF {print $1; exit}')
+  used_mem_kib=$(virsh dominfo "${vm}" 2>/dev/null | awk '$1=="Used" && $2=="memory:" && $3 ~ /^[0-9]+$/ {print $3; exit}')
+  if [[ ! "${used_mem_kib}" =~ ^[0-9]+$ || "${used_mem_kib}" -eq 0 ]]; then
+    log "[NUMA] ${vm}: cannot read configured guest memory; refusing incomplete binding."
+    return 1
+  fi
+  memory_gib=$(( (used_mem_kib + 1048575) / 1048576 ))
+  numa_validate_guest_request "${vm}" "${node}" "${max_vcpus}" "${memory_gib}" || return 1
+  IFS=, read -r -a pcpu <<< "${cpus}"
+  if [[ "${DRY_RUN:-1}" -eq 1 ]]; then
+    log "[DRY-RUN] ${vm}: vcpupin 0..$((max_vcpus-1)) => NUMA${node} cpus ${cpus}; emulatorpin ${cpus}; numatune --mode strict --nodeset ${node} (--config)"
+    return 0
+  fi
+  if ! virsh emulatorpin "${vm}" "${cpus}" --config >/dev/null 2>&1; then
+    log "[ERROR] ${vm}: NUMA${node} emulatorpin failed"
+    return 1
+  fi
+  for ((i=0; i<max_vcpus; i++)); do
+    if ! virsh vcpupin "${vm}" "${i}" "${pcpu[i]}" --config >/dev/null 2>&1; then
+      log "[ERROR] ${vm}: NUMA${node} pinning vCPU ${i} to pCPU ${pcpu[i]} failed"
+      return 1
+    fi
+  done
+  if ! virsh numatune "${vm}" --mode strict --nodeset "${node}" --config >/dev/null 2>&1; then
+    log "[ERROR] ${vm}: NUMA${node} strict memory policy failed"
+    return 1
+  fi
+  log "[NUMA] ${vm}: ${max_vcpus} vCPUs pinned to NUMA${node}, emulatorpin=${cpus}, memory mode=strict nodeset=${node} (--config)"
+  return 0
+}
+# Confirm the persistent libvirt policy, rather than considering cputune alone a
+# complete NUMA configuration. virsh reports 'numa_mode' and 'numa_nodeset'.
+numa_check_vm_memory_policy() {
+  local vm="${1:-}" node="${2:-}" status=""
+  status=$(virsh numatune "${vm}" --config 2>/dev/null) || return 1
+  printf '%s\n' "${status}" | awk -F: -v node="${node}" '
+    /numa_mode/ {gsub(/[[:space:]]/, "", $2); mode=$2}
+    /numa_nodeset/ {gsub(/[[:space:]]/, "", $2); nodes=$2}
+    END {exit !(mode=="strict" && nodes==node)}
+  '
+}
+# END NUMA HELPERS
+
 # Keep the original 545GiB AIO root LV unchanged. When the existing Ubuntu VG
 # cannot also fit the legacy 400GiB Sensor LV, use its real free capacity with
 # 5GiB left unallocated. Never grow the Ubuntu root filesystem to make space.
@@ -7052,35 +7224,6 @@ step_09_aio_deploy() {
         fi
     fi
 
-    # If aio already exists, require exact typed confirmation before destroy/cleanup.
-    if virsh dominfo "${AIO_HOSTNAME}" >/dev/null 2>&1; then
-        if ! confirm_destroy_vm "${AIO_HOSTNAME}" "STEP 09 - AIO VM Deployment"; then
-            log "[STEP 09] Existing ${AIO_HOSTNAME} VM was kept; redeployment canceled."
-            return 0
-        fi
-
-        echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 09] Exact confirmation received. Destroying and undefining ${AIO_HOSTNAME}..."
-
-        local AIO_VM_DIR="${AIO_IMAGE_DIR}/${AIO_HOSTNAME}"
-
-        if [ "${_DRY_RUN}" -eq 1 ]; then
-            echo "[DRY_RUN] virsh destroy ${AIO_HOSTNAME} || true"
-            echo "[DRY_RUN] virsh undefine ${AIO_HOSTNAME} --nvram || virsh undefine ${AIO_HOSTNAME} || true"
-            echo "[DRY_RUN] rm -f '${AIO_VM_DIR}/${AIO_HOSTNAME}.raw' || true"
-            echo "[DRY_RUN] rm -f '${AIO_VM_DIR}/${AIO_HOSTNAME}.log' || true"
-        else
-            virsh destroy "${AIO_HOSTNAME}" >/dev/null 2>&1 || true
-            virsh undefine "${AIO_HOSTNAME}" --nvram >/dev/null 2>&1 || virsh undefine "${AIO_HOSTNAME}" >/dev/null 2>&1 || true
-
-            if [ -d "${AIO_VM_DIR}" ]; then
-                echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 09] Removing old AIO image files in ${AIO_VM_DIR}."
-                sudo rm -rf "${AIO_VM_DIR}"/* 2>/dev/null || true
-                sudo rmdir "${AIO_VM_DIR}" 2>/dev/null || true
-                log "[STEP 09] Old AIO image directory ${AIO_VM_DIR} cleaned up"
-            fi
-        fi
-    fi
-
     ############################################################
     # Prompt for AIO VM configuration (memory, vCPU, disk)
     ############################################################
@@ -7095,25 +7238,33 @@ step_09_aio_deploy() {
     available_mem_gb=$((total_mem_gb - host_reserve_gb))
     [[ ${available_mem_gb} -le 0 ]] && available_mem_gb=16
     
-    # Check NUMA configuration for AIO vCPU default calculation
-    # AIO default: All NUMA0 vCPUs
+    # NUMA topology: count online logical CPU IDs, never comma-delimited ranges.
     local numa_nodes=1
     local node0_cpus="" node0_count=0
-    if command -v lscpu >/dev/null 2>&1; then
-      numa_nodes=$(lscpu | grep "^NUMA node(s):" | awk '{print $3}')
-      if [[ "${numa_nodes}" -ge 2 ]]; then
-        # Extract NUMA node0 CPU list
-        node0_cpus=$(lscpu | grep "NUMA node0 CPU(s):" | sed 's/NUMA node0 CPU(s)://' | tr -d '[:space:]')
-        # Count CPUs in NUMA node0
-        if [[ -n "${node0_cpus}" ]]; then
-          node0_count=$(echo "${node0_cpus}" | tr ',' '\n' | wc -l)
-        fi
-      fi
+    numa_nodes=$(numa_node_count)
+    if (( numa_nodes >= 2 )); then
+      node0_cpus=$(numa_node_cpu_list 0) || {
+        log "[ERROR] NUMA0 online CPU topology unavailable; AIO deployment blocked."
+        return 1
+      }
+      node0_count=$(numa_cpu_count "${node0_cpus}") || return 1
+      log "[STEP 09] NUMA0 online CPU count=${node0_count}; CPUs=${node0_cpus}"
     fi
     
     # Default memory: 70% of available memory (after 12% host reserve) for AIO
     local default_aio_mem_gb=$((available_mem_gb * 70 / 100))
     [[ ${default_aio_mem_gb} -lt 8 ]] && default_aio_mem_gb=8
+    if (( numa_nodes >= 2 )); then
+      local numa0_mem_limit_gb
+      numa0_mem_limit_gb=$(numa_node_memory_limit_gib 0) || {
+        log "[ERROR] NUMA0 RAM capacity unavailable; cannot safely bind AIO memory."
+        return 1
+      }
+      if (( default_aio_mem_gb > numa0_mem_limit_gb )); then
+        log "[STEP 09] AIO default memory capped from ${default_aio_mem_gb}GiB to NUMA0 safe limit ${numa0_mem_limit_gb}GiB."
+        default_aio_mem_gb="${numa0_mem_limit_gb}"
+      fi
+    fi
     
     # Default vCPU: All NUMA0 CPUs (if NUMA0 detected)
     # This ensures AIO gets all CPUs from NUMA0
@@ -7137,7 +7288,7 @@ step_09_aio_deploy() {
     # 1) Memory
     # Always use calculated default value for input box (not saved value)
     local _AIO_MEM_INPUT
-    _AIO_MEM_INPUT="$(whiptail_inputbox "STEP 09 - AIO memory" "Enter memory (GB) for AIO VM.\n\nTotal memory: ${total_mem_gb}GB\nHost reserve (12%): ${host_reserve_gb}GB\nAvailable: ${available_mem_gb}GB\nDefault value: ${default_aio_mem_gb}GB (70% of available)\nExample: Enter 136" "${default_aio_mem_gb}" 14 80)"
+    _AIO_MEM_INPUT="$(whiptail_inputbox "STEP 09 - AIO memory" "Enter memory (GB) for AIO VM.\n\nTotal memory: ${total_mem_gb}GB\nHost reserve (12%): ${host_reserve_gb}GB\nAvailable: ${available_mem_gb}GB\nDefault value: ${default_aio_mem_gb}GB (70% baseline, capped by NUMA0 when applicable)\nNUMA0 safe limit: ${numa0_mem_limit_gb:-N/A}GB\nExample: Enter ${default_aio_mem_gb}" "${default_aio_mem_gb}" 14 80)"
 
     if [ $? -eq 0 ] && [ -n "${_AIO_MEM_INPUT}" ]; then
         if [[ "${_AIO_MEM_INPUT}" =~ ^[0-9]+$ ]] && [ "${_AIO_MEM_INPUT}" -gt 0 ]; then
@@ -7170,6 +7321,15 @@ step_09_aio_deploy() {
     else
         # User canceled or empty input - use default
         AIO_VCPUS="${default_aio_vcpus}"
+    fi
+
+    # Validate before VM deployment: every requested vCPU and all guest RAM
+    # must fit on NUMA0 if strict NUMA placement is requested.
+    if (( numa_nodes >= 2 )); then
+      if ! numa_validate_guest_request "aio" 0 "${AIO_VCPUS}" "${AIO_MEMORY_GB}"; then
+        whiptail_msgbox "STEP 09 - NUMA0 capacity exceeded" "The selected AIO vCPU/memory does not fit NUMA0.\nReview the NUMA0 CPU count and memory limit above; no VM deployment has started." 15 80
+        return 1
+      fi
     fi
 
     # 3) Disk size
@@ -7259,6 +7419,36 @@ Run virt_deploy_uvp_centos.sh with these settings?"
         return 0
     fi
 
+    # Redeploy existing AIO only AFTER validating CPU/memory and showing the
+    # final execution confirmation. Keep the existing typed deletion safeguard.
+    if virsh dominfo "${AIO_HOSTNAME}" >/dev/null 2>&1; then
+        if ! confirm_destroy_vm "${AIO_HOSTNAME}" "STEP 09 - AIO VM Deployment"; then
+            log "[STEP 09] Existing ${AIO_HOSTNAME} VM was kept; redeployment canceled."
+            return 0
+        fi
+
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 09] Exact confirmation received. Destroying and undefining ${AIO_HOSTNAME}..."
+
+        local AIO_VM_DIR="${AIO_IMAGE_DIR}/${AIO_HOSTNAME}"
+
+        if [ "${_DRY_RUN}" -eq 1 ]; then
+            echo "[DRY_RUN] virsh destroy ${AIO_HOSTNAME} || true"
+            echo "[DRY_RUN] virsh undefine ${AIO_HOSTNAME} --nvram || virsh undefine ${AIO_HOSTNAME} || true"
+            echo "[DRY_RUN] rm -f '${AIO_VM_DIR}/${AIO_HOSTNAME}.raw' || true"
+            echo "[DRY_RUN] rm -f '${AIO_VM_DIR}/${AIO_HOSTNAME}.log' || true"
+        else
+            virsh destroy "${AIO_HOSTNAME}" >/dev/null 2>&1 || true
+            virsh undefine "${AIO_HOSTNAME}" --nvram >/dev/null 2>&1 || virsh undefine "${AIO_HOSTNAME}" >/dev/null 2>&1 || true
+
+            if [ -d "${AIO_VM_DIR}" ]; then
+                echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 09] Removing old AIO image files in ${AIO_VM_DIR}."
+                sudo rm -rf "${AIO_VM_DIR}"/* 2>/dev/null || true
+                sudo rmdir "${AIO_VM_DIR}" 2>/dev/null || true
+                log "[STEP 09] Old AIO image directory ${AIO_VM_DIR} cleaned up"
+            fi
+        fi
+    fi
+
     # Actual execution
     if [[ "${DRY_RUN}" -eq 1 ]]; then
         log "[DRY-RUN] Would execute: ${CMD}"
@@ -7270,19 +7460,14 @@ Run virt_deploy_uvp_centos.sh with these settings?"
         if [ "${deploy_rc}" -eq 0 ]; then
             echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 09] AIO VM deployment completed successfully."
             
-            # Apply CPU affinity to NUMA0
-            if [[ -n "${NUMA_NODES:-}" && "${NUMA_NODES}" -gt 1 ]]; then
-                log "[STEP 09] Applying CPU affinity to NUMA0 for AIO VM"
+            # Apply persistent NUMA0 CPU + strict memory affinity immediately.
+            # STEP 12 also reapplies after SPAN changes and restarts both VMs.
+            if (( numa_nodes >= 2 )); then
                 local numa0_cpus
-                numa0_cpus=$(lscpu | grep "NUMA node0 CPU(s):" | sed 's/NUMA node0 CPU(s)://' | tr -d '[:space:]')
-                if [[ -n "${numa0_cpus}" ]]; then
-                    virsh emulatorpin "${AIO_HOSTNAME}" "${numa0_cpus}" --config >/dev/null 2>&1 || true
-                    local max_vcpus
-                    max_vcpus="$(virsh vcpucount "${AIO_HOSTNAME}" --maximum --config 2>/dev/null || echo 0)"
-                    for (( i=0; i<max_vcpus; i++ )); do
-                        virsh vcpupin "${AIO_HOSTNAME}" "${i}" "${numa0_cpus}" --config >/dev/null 2>&1 || true
-                    done
-                    log "[STEP 09] CPU affinity applied to NUMA0 (cpuset=${numa0_cpus})"
+                numa0_cpus=$(numa_node_cpu_list 0) || return 1
+                if ! numa_apply_vm_policy "${AIO_HOSTNAME}" 0; then
+                    log "[ERROR] STEP 09: NUMA0 policy application failed. Fix before STEP 12."
+                    return 1
                 fi
             fi
             
@@ -7326,7 +7511,7 @@ Run virt_deploy_uvp_centos.sh with these settings?"
                 echo "  • Install directory: ${AIO_INSTALL_DIR}"
                 echo "  • Image directory: ${AIO_IMAGE_DIR}"
                 echo
-                if [[ -n "${NUMA_NODES:-}" && "${NUMA_NODES}" -gt 1 ]]; then
+                if (( numa_nodes >= 2 )); then
                     echo "⚙️  CPU AFFINITY:"
                     echo "  • NUMA node: NUMA0"
                     if [[ -n "${numa0_cpus:-}" ]]; then
@@ -8183,25 +8368,33 @@ step_11_sensor_deploy() {
   available_mem_gb=$((total_mem_gb - host_reserve_gb))
   [[ ${available_mem_gb} -le 0 ]] && available_mem_gb=16
   
-  # Check NUMA configuration for Sensor vCPU default calculation
-  # Sensor default: NUMA1 vCPUs minus 4 (4 CPUs reserved for host)
+  # Sensor defaults to NUMA1 with 4 online host CPUs reserved on that node.
   local numa_nodes=1
   local node1_cpus="" node1_count=0
-  if command -v lscpu >/dev/null 2>&1; then
-    numa_nodes=$(lscpu | grep "^NUMA node(s):" | awk '{print $3}')
-    if [[ "${numa_nodes}" -ge 2 ]]; then
-      # Extract NUMA node1 CPU list
-      node1_cpus=$(lscpu | grep "NUMA node1 CPU(s):" | sed 's/NUMA node1 CPU(s)://' | tr -d '[:space:]')
-      # Count CPUs in NUMA node1
-      if [[ -n "${node1_cpus}" ]]; then
-        node1_count=$(echo "${node1_cpus}" | tr ',' '\n' | wc -l)
-      fi
-    fi
+  numa_nodes=$(numa_node_count)
+  if (( numa_nodes >= 2 )); then
+    node1_cpus=$(numa_node_cpu_list 1) || {
+      log "[ERROR] NUMA1 online CPU topology unavailable; Sensor deployment blocked."
+      return 1
+    }
+    node1_count=$(numa_cpu_count "${node1_cpus}") || return 1
+    log "[STEP 11] NUMA1 online CPU count=${node1_count}; CPUs=${node1_cpus}"
   fi
   
   # Default memory: 30% of available memory (after 12% host reserve) for Sensor
   local default_sensor_mem_gb=$((available_mem_gb * 30 / 100))
   [[ ${default_sensor_mem_gb} -lt 8 ]] && default_sensor_mem_gb=8
+  if (( numa_nodes >= 2 )); then
+    local numa1_mem_limit_gb
+    numa1_mem_limit_gb=$(numa_node_memory_limit_gib 1) || {
+      log "[ERROR] NUMA1 RAM capacity unavailable; cannot safely bind Sensor memory."
+      return 1
+    }
+    if (( default_sensor_mem_gb > numa1_mem_limit_gb )); then
+      log "[STEP 11] MDS default memory capped from ${default_sensor_mem_gb}GiB to NUMA1 safe limit ${numa1_mem_limit_gb}GiB."
+      default_sensor_mem_gb="${numa1_mem_limit_gb}"
+    fi
+  fi
   
   # Default vCPU: NUMA1 CPUs minus 4 (4 CPUs reserved for host)
   # This ensures Sensor gets NUMA1 CPUs except 4 reserved for host
@@ -8253,7 +8446,7 @@ step_11_sensor_deploy() {
   local sensor_mem_gb="${default_sensor_mem_gb}"
   local _SENSOR_MEM_INPUT
   local mem_input_rc
-  _SENSOR_MEM_INPUT="$(whiptail_inputbox "STEP 11 - Sensor (MDS) memory" "Enter memory (GB) for Sensor VM (mds).\n\nTotal memory: ${total_mem_gb}GB\nHost reserve (12%): ${host_reserve_gb}GB\nAvailable: ${available_mem_gb}GB\nDefault value: ${default_sensor_mem_gb}GB (30% of available)\nExample: Enter 32" "${default_sensor_mem_gb}" 14 80)"
+  _SENSOR_MEM_INPUT="$(whiptail_inputbox "STEP 11 - Sensor (MDS) memory" "Enter memory (GB) for Sensor VM (mds).\n\nTotal memory: ${total_mem_gb}GB\nHost reserve (12%): ${host_reserve_gb}GB\nAvailable: ${available_mem_gb}GB\nDefault value: ${default_sensor_mem_gb}GB (30% baseline, capped by NUMA1 when applicable)\nNUMA1 safe limit: ${numa1_mem_limit_gb:-N/A}GB\nExample: Enter ${default_sensor_mem_gb}" "${default_sensor_mem_gb}" 14 80)"
   mem_input_rc=$?
 
   if [ ${mem_input_rc} -ne 0 ]; then
@@ -8303,6 +8496,14 @@ step_11_sensor_deploy() {
   else
     # Empty input - use default
     sensor_vcpus="${default_sensor_vcpus}"
+  fi
+
+  # Reject over-allocation before touching any existing Sensor VM.
+  if (( numa_nodes >= 2 )); then
+    if ! numa_validate_guest_request "mds" 1 "${sensor_vcpus}" "${sensor_mem_gb}"; then
+      whiptail_msgbox "STEP 11 - NUMA1 capacity exceeded" "The selected Sensor vCPU/memory does not fit NUMA1.\nReview the NUMA1 CPU count and memory limit above; no Sensor VM deployment has started." 15 80
+      return 1
+    fi
   fi
 
   # 3) Disk size
@@ -8383,25 +8584,17 @@ step_11_sensor_deploy() {
     log "[STEP 11] Sensor image preflight passed: format=qcow2, virtual_size=${image_virtual_gib}GB, requested_disk=${disksize}GB, LV=${sensor_lv_gib}GB"
   fi
 
-  # NUMA Aware CPUSET Calculation Logic for mds (NUMA1)
-  local numa_nodes=1
-  local node1_cpus=""
-  if command -v lscpu >/dev/null 2>&1; then
-    numa_nodes=$(lscpu | grep "^NUMA node(s):" | awk '{print $3}')
-    if [[ "${numa_nodes}" -ge 2 ]]; then
-      # Extract NUMA node1 CPU list
-      node1_cpus=$(lscpu | grep "NUMA node1 CPU(s):" | sed 's/NUMA node1 CPU(s)://' | tr -d '[:space:]')
-    fi
-  fi
-
+  # Store the exact online pCPU IDs reserved for Sensor on NUMA1; do not
+  # truncate a Linux range string such as 24-47,72-95 by comma.
   local sensor_cpuset_mds
-  if [[ "${numa_nodes}" -ge 2 && -n "${node1_cpus}" ]]; then
-    log "[STEP 11] NUMA node(${numa_nodes}) Detected. Setting CPU Pinning for mds on NUMA1."
-    # Cut the list according to the number of vCPUs entered by the user (allocate from the front)
-    sensor_cpuset_mds=$(echo "${node1_cpus}" | cut -d',' -f1-"${sensor_vcpus}")
-    log "  -> MDS (Node1): ${sensor_cpuset_mds}"
+  if (( numa_nodes >= 2 )); then
+    sensor_cpuset_mds=$(numa_take_cpus "${node1_cpus}" "${sensor_vcpus}") || {
+      log "[ERROR] Requested MDS CPU count exceeds NUMA1 online CPU list."
+      return 1
+    }
+    log "[STEP 11] MDS NUMA1 CPU selection: ${sensor_cpuset_mds}"
   else
-    log "[STEP 11] NUMA detection failed. Using sequential allocation."
+    log "[STEP 11] Single NUMA node; retaining legacy sequential CPU allocation."
     sensor_cpuset_mds="0-$((sensor_vcpus-1))"
   fi
 
@@ -8685,12 +8878,8 @@ step_12_sensor_passthrough() {
     # Check NUMA count (use lscpu)
     ###########################################################################
     local numa_nodes=1
-    if command -v lscpu >/dev/null 2>&1; then
-        numa_nodes=$(lscpu | grep "^NUMA node(s):" | awk '{print $3}')
-    fi
-    [[ -z "${numa_nodes}" ]] && numa_nodes=1
-
-    log "[STEP 12] NUMA node count: ${numa_nodes}"
+    numa_nodes=$(numa_node_count)
+    log "[STEP 12] Online NUMA node count: ${numa_nodes}"
 
     ###########################################################################
     # common path
@@ -8910,82 +9099,19 @@ EOF
         fi
 
         #######################################################################
-        # 4. Apply CPU Affinity (multiple NUMA only) - mds uses NUMA1
+        # 4. Apply CPU and strict local memory policy to NUMA1.
         #######################################################################
-        if [[ "${numa_nodes}" -gt 1 ]]; then
-            log "[STEP 12] ${SENSOR_VM}: CPU Affinity application start"
-
-            local cpuset_for_vm="${SENSOR_CPUSET_MDS:-}"
-
-            if [[ -z "${cpuset_for_vm}" ]]; then
-                # Extract NUMA node1 CPU list for mds
-                local node1_cpus
-                node1_cpus=$(lscpu | grep "NUMA node1 CPU(s):" | sed 's/NUMA node1 CPU(s)://' | tr -d '[:space:]')
-                if [[ -n "${node1_cpus}" ]]; then
-                    cpuset_for_vm="${node1_cpus}"
-                else
-                    log "[WARN] ${SENSOR_VM}: Cannot retrieve NUMA node1 CPU list, cannot apply Affinity."
-                    cpuset_for_vm=""
-                fi
-            fi
-
-            if [[ -z "${cpuset_for_vm}" ]]; then
-                log "[WARN] ${SENSOR_VM}: Per VM CPUSET is empty, so skip Affinity"
-            else
-                # Convert cpuset string to array (e.g., "48,49,50" -> array with 48, 49, 50)
-                local cpu_arr=()
-                local c
-                for c in $(echo "${cpuset_for_vm}" | tr ',' ' '); do
-                    cpu_arr+=("${c}")
-                done
-
-                if [[ "${#cpu_arr[@]}" -eq 0 ]]; then
-                    log "[WARN] ${SENSOR_VM}: CPU array is empty, so skip Affinity"
-                else
-                    log "[ACTION] ${SENSOR_VM}: CPU Affinity configuration (CPU list: ${cpuset_for_vm})"
-                    
-                    # Get maximum vCPU count
-                    local max_vcpus
-                    max_vcpus="$(virsh vcpucount "${SENSOR_VM}" --maximum --config 2>/dev/null || echo 0)"
-                    max_vcpus=$(echo "${max_vcpus}" | tr -d '\n\r' | grep -o '[0-9]*' | head -1)
-                    [[ -z "${max_vcpus}" ]] && max_vcpus="0"
-
-                    if [[ "${max_vcpus}" -eq 0 ]]; then
-                        log "[WARN] ${SENSOR_VM}: Unable to determine vCPU count → skipping CPU Affinity"
-                    else
-                        # Limit vCPU count to available CPUs
-                        if [[ "${#cpu_arr[@]}" -lt "${max_vcpus}" ]]; then
-                            log "[WARN] ${SENSOR_VM}: CPU list count(${#cpu_arr[@]}) is less than maximum vCPU(${max_vcpus}). Limiting to ${#cpu_arr[@]} vCPUs."
-                            max_vcpus="${#cpu_arr[@]}"
-                        fi
-
-                        # Set emulatorpin to all CPUs in the list (for emulator thread)
-                        local emulator_cpuset
-                        emulator_cpuset=$(echo "${cpuset_for_vm}" | tr ' ' ',')
-                        if [[ "${_DRY}" -eq 0 ]]; then
-                            virsh emulatorpin "${SENSOR_VM}" "${emulator_cpuset}" --config >/dev/null 2>&1 || true
-                            
-                            # Pin each vCPU to individual pCPU
-                            local i
-                            for (( i=0; i<max_vcpus; i++ )); do
-                                local pcpu="${cpu_arr[$i]}"
-                                if virsh vcpupin "${SENSOR_VM}" "${i}" "${pcpu}" --config >/dev/null 2>&1; then
-                                    log "[STEP 12] ${SENSOR_VM}: vCPU ${i} -> pCPU ${pcpu} pin (--config) completed"
-                                else
-                                    log "[WARN] ${SENSOR_VM}: vCPU ${i} -> pCPU ${pcpu} pin failed"
-                                fi
-                            done
-                        else
-                            log "[DRY-RUN] ${SENSOR_VM}: emulatorpin cpuset=${emulator_cpuset} (not executed)"
-                            for (( i=0; i<max_vcpus; i++ )); do
-                                local pcpu="${cpu_arr[$i]}"
-                                log "[DRY-RUN] ${SENSOR_VM}: vcpupin ${i} ${pcpu} --config (not executed)"
-                            done
-                        fi
-                    fi
+        local cpuset_for_vm=""
+        if (( numa_nodes >= 2 )); then
+            cpuset_for_vm=$(numa_node_cpu_list 1) || {
+                log "[ERROR] ${SENSOR_VM}: NUMA1 topology unavailable."
+                return 1
+            }
+            if ! numa_apply_vm_policy "${SENSOR_VM}" 1; then
+                log "[ERROR] ${SENSOR_VM}: NUMA1 CPU/memory policy failed."
+                return 1
             fi
         fi
-    fi
 
         #######################################################################
         # 4.5 Safe restart to apply configuration
@@ -9114,133 +9240,35 @@ EOF
     done
 
     ###########################################################################
-    # Process AIO VM CPU Affinity (if multiple NUMA nodes)
+    # Process AIO CPU and strict local memory policy (NUMA0).
     ###########################################################################
-    log "[STEP 12] ===== Starting AIO VM CPU Affinity processing ====="
-    log "[STEP 12] NUMA nodes count: ${numa_nodes}"
-    if [[ "${numa_nodes}" -gt 1 ]]; then
-        log "[STEP 12] ----- AIO VM CPU Affinity processing start: aio -----"
-        
-        local AIO_VM="aio"
-        
-        # Check AIO VM existence
-        local actual_cpuset_aio=""
-        local cpuset_for_aio=""
-        
+    log "[STEP 12] ===== Starting AIO NUMA0 CPU/memory affinity processing ====="
+    local AIO_VM="aio"
+    local actual_cpuset_aio=""
+    local cpuset_for_aio=""
+    if (( numa_nodes >= 2 )); then
         if ! virsh dominfo "${AIO_VM}" >/dev/null 2>&1; then
-            log "[STEP 12] WARNING: AIO VM(${AIO_VM}) not found. Skip CPU affinity configuration."
+            log "[WARN] AIO VM not defined; NUMA0 binding cannot be applied."
         else
-            log "[STEP 12] ${AIO_VM}: CPU Affinity application start"
-            
-            cpuset_for_aio="${AIO_CPUSET:-}"
-            
-            if [[ -z "${cpuset_for_aio}" ]]; then
-                # Extract NUMA node0 CPU list for aio
-                local node0_cpus
-                node0_cpus=$(lscpu | grep "NUMA node0 CPU(s):" | sed 's/NUMA node0 CPU(s)://' | tr -d '[:space:]')
-                if [[ -n "${node0_cpus}" ]]; then
-                    cpuset_for_aio="${node0_cpus}"
-                else
-                    log "[WARN] ${AIO_VM}: Cannot retrieve NUMA node0 CPU list, cannot apply Affinity."
-                    cpuset_for_aio=""
-                fi
+            cpuset_for_aio=$(numa_node_cpu_list 0) || {
+                log "[ERROR] AIO: NUMA0 topology unavailable."
+                return 1
+            }
+            if ! numa_apply_vm_policy "${AIO_VM}" 0; then
+                log "[ERROR] AIO: NUMA0 CPU/memory policy failed."
+                return 1
             fi
-            
-            if [[ -z "${cpuset_for_aio}" ]]; then
-                log "[WARN] ${AIO_VM}: CPUSET is empty, so skip Affinity"
-            else
-                # Convert cpuset string to array (e.g., "0,2,4,6" -> array with 0, 2, 4, 6)
-                local cpu_arr=()
-                local c
-                for c in $(echo "${cpuset_for_aio}" | tr ',' ' '); do
-                    cpu_arr+=("${c}")
-                done
-
-                if [[ "${#cpu_arr[@]}" -eq 0 ]]; then
-                    log "[WARN] ${AIO_VM}: CPU array is empty, so skip Affinity"
-                else
-                    log "[ACTION] ${AIO_VM}: CPU Affinity configuration (CPU list: ${cpuset_for_aio})"
-                    
-                    # Safely stop if VM is running (for CPU affinity configuration)
-                    if virsh list --name | grep -q "^${AIO_VM}$"; then
-                        log "[STEP 12] ${AIO_VM}: Running → shutdown"
-                        virsh shutdown "${AIO_VM}" >/dev/null 2>&1 || true
-                        
-                        local t=0
-                        while virsh list --name | grep -q "^${AIO_VM}$"; do
-                            sleep 2
-                            t=$((t+2))
-                            if [[ $t -ge 120 ]]; then
-                                log "[WARN] ${AIO_VM}: shutdown timeout → destroy"
-                                virsh destroy "${AIO_VM}" >/dev/null 2>&1 || true
-                                break
-                            fi
-                        done
-                    fi
-                    
-                    # Get maximum vCPU count
-                    local max_vcpus
-                    max_vcpus="$(virsh vcpucount "${AIO_VM}" --maximum --config 2>/dev/null || echo 0)"
-                    max_vcpus=$(echo "${max_vcpus}" | tr -d '\n\r' | grep -o '[0-9]*' | head -1)
-                    [[ -z "${max_vcpus}" ]] && max_vcpus="0"
-
-                    if [[ "${max_vcpus}" -eq 0 ]]; then
-                        log "[WARN] ${AIO_VM}: Unable to determine vCPU count → skipping CPU Affinity"
-                    else
-                        # Limit vCPU count to available CPUs
-                        if [[ "${#cpu_arr[@]}" -lt "${max_vcpus}" ]]; then
-                            log "[WARN] ${AIO_VM}: CPU list count(${#cpu_arr[@]}) is less than maximum vCPU(${max_vcpus}). Limiting to ${#cpu_arr[@]} vCPUs."
-                            max_vcpus="${#cpu_arr[@]}"
-                        fi
-
-                        # Set emulatorpin to all CPUs in the list (for emulator thread)
-                        local emulator_cpuset
-                        emulator_cpuset=$(echo "${cpuset_for_aio}" | tr ' ' ',')
-                        if [[ "${_DRY}" -eq 0 ]]; then
-                            virsh emulatorpin "${AIO_VM}" "${emulator_cpuset}" --config >/dev/null 2>&1 || true
-                            
-                            # Pin each vCPU to individual pCPU
-                            local i
-                            for (( i=0; i<max_vcpus; i++ )); do
-                                local pcpu="${cpu_arr[$i]}"
-                                if virsh vcpupin "${AIO_VM}" "${i}" "${pcpu}" --config >/dev/null 2>&1; then
-                                    log "[STEP 12] ${AIO_VM}: vCPU ${i} -> pCPU ${pcpu} pin (--config) completed"
-                                else
-                                    log "[WARN] ${AIO_VM}: vCPU ${i} -> pCPU ${pcpu} pin failed"
-                                fi
-                            done
-                            log "[STEP 12] ${AIO_VM}: CPU Affinity applied to NUMA0 (CPU list: ${cpuset_for_aio})"
-                            
-                            # Get actual CPU affinity setting for display
-                            actual_cpuset_aio=$(virsh emulatorpin "${AIO_VM}" --config 2>/dev/null | grep "emulator: CPU Affinity" | sed 's/.*: //' || echo "")
-                            if [[ -z "${actual_cpuset_aio}" ]]; then
-                                actual_cpuset_aio="${emulator_cpuset}"
-                            fi
-                            
-                            # Save AIO_CPUSET to configuration
-                            AIO_CPUSET="${cpuset_for_aio}"
-                            if type save_config >/dev/null 2>&1; then
-                                save_config
-                            fi
-                        else
-                            log "[DRY-RUN] ${AIO_VM}: emulatorpin cpuset=${emulator_cpuset} (not executed)"
-                            for (( i=0; i<max_vcpus; i++ )); do
-                                local pcpu="${cpu_arr[$i]}"
-                                log "[DRY-RUN] ${AIO_VM}: vcpupin ${i} ${pcpu} --config (not executed)"
-                            done
-                            actual_cpuset_aio="${emulator_cpuset}"
-                        fi
-                        
-                        # Safe restart to apply configuration
-                        restart_vm_safely "${AIO_VM}"
-                    fi
-                fi
+            actual_cpuset_aio="${cpuset_for_aio}"
+            AIO_CPUSET="${cpuset_for_aio}"
+            if type save_config >/dev/null 2>&1; then save_config; fi
+            if ! restart_vm_safely "${AIO_VM}"; then
+                log "[ERROR] AIO: failed to restart with NUMA0 binding."
+                return 1
             fi
         fi
-        
-        log "[STEP 12] ----- AIO VM CPU Affinity processing completed: aio -----"
     fi
-    
+    log "[STEP 12] ----- AIO NUMA0 CPU/memory policy completed -----"
+
     #######################################################################
     # AIO data disk (LV) attach (vg_aio/lv_aio → vdb, --config)
     # This is done regardless of NUMA configuration
@@ -11064,6 +11092,22 @@ build_validation_summary() {
     warn_msgs+=("mds VM XML does not have CPU pinning (cputune) configuration.")
     warn_msgs+=("  → ACTION: Re-run STEP 12 (PCI Passthrough / CPU Affinity)")
     warn_msgs+=("  → NOTE: NUMA1-based vCPU placement may not be applied without this")
+  fi
+
+  # Verify strict per-node guest memory placement, not just vCPU pinning.
+  if [[ "$(numa_node_count)" -gt 1 ]]; then
+    if numa_check_vm_memory_policy aio 0; then
+      ok_msgs+=("aio NUMA memory policy: strict, host nodeset 0")
+    else
+      warn_msgs+=("aio NUMA memory binding is absent or not strict on node 0.")
+      warn_msgs+=("  → ACTION: Re-run STEP 12 (CPU/NUMA affinity)")
+    fi
+    if numa_check_vm_memory_policy mds 1; then
+      ok_msgs+=("mds NUMA memory policy: strict, host nodeset 1")
+    else
+      warn_msgs+=("mds NUMA memory binding is absent or not strict on node 1.")
+      warn_msgs+=("  → ACTION: Re-run STEP 12 (CPU/NUMA affinity)")
+    fi
   fi
 
   ###############################
