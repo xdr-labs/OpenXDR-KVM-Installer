@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #
 # XDR Sensor Install Framework (SSH + Whiptail based TUI)
-# Modified from OpenXDR-installer.sh for Sensor-specific use
+# Standalone modular Sensor deployment on KVM hosts
 #
 
 set -euo pipefail
@@ -463,6 +463,254 @@ run_cmd_linkscan() {
     log "[ERROR] Link-scan command failed (exit code: ${exit_code}): ${cmd}"
   fi
   return "${exit_code}"
+}
+
+lvm_floor_units() {
+  awk 'NF {gsub(/[^0-9.]/, "", $1); if ($1 != "") {printf "%d\n", $1; exit}}'
+}
+
+
+ensure_ubuntu_vg_free_space() {
+  local step_label="$1"
+  local ubuntu_vg="$2"
+  local root_dev="$3"
+  local required_lv_mib="$4"
+  local safety_buffer_mib="${5:-1024}"
+
+  local vg_free_mib
+  vg_free_mib=$(sudo vgs --noheadings --units m --nosuffix -o vg_free "${ubuntu_vg}" 2>/dev/null \
+    | lvm_floor_units)
+  [[ -z "${vg_free_mib}" ]] && vg_free_mib=0
+
+  if [[ "${vg_free_mib}" -ge "${required_lv_mib}" ]]; then
+    return 0
+  fi
+
+  log "[${step_label}] ${ubuntu_vg} free space is insufficient (${vg_free_mib}MiB < ${required_lv_mib}MiB). Expanding VG from OS disk free area."
+
+  local root_pv os_disk_base os_disk
+  root_pv=$(sudo lvs --noheadings -o devices "${root_dev}" 2>/dev/null \
+    | awk -F'[(), ]+' 'NF {print $1; exit}')
+  if [[ -z "${root_pv}" ]]; then
+    root_pv=$(sudo pvs --noheadings -o pv_name --select "vg_name=${ubuntu_vg}" 2>/dev/null \
+      | awk 'NF {print $1; exit}')
+  fi
+  if [[ -z "${root_pv}" ]]; then
+    log "[ERROR] Failed to detect root PV for ${ubuntu_vg}. Cannot continue safely."
+    return 1
+  fi
+
+  os_disk_base=$(lsblk -no PKNAME "${root_pv}" 2>/dev/null | awk 'NF {print $1; exit}')
+  if [[ -z "${os_disk_base}" ]]; then
+    os_disk_base=$(basename "${root_pv}")
+  fi
+  os_disk="/dev/${os_disk_base}"
+
+  if [[ ! -b "${os_disk}" ]]; then
+    log "[ERROR] Detected OS disk is invalid: ${os_disk}. Aborting."
+    return 1
+  fi
+
+  local required_partition_mib free_segment_info free_mib free_start_mib free_end_mib
+  required_partition_mib=$((required_lv_mib + safety_buffer_mib))
+
+  free_segment_info=$(sudo parted -m "${os_disk}" unit MiB print free 2>/dev/null \
+    | awk -F: '$1 ~ /^[0-9]+$/ && $NF ~ /free;$/ {
+                 gsub("MiB","",$2); gsub("MiB","",$3); gsub("MiB","",$4);
+                 size=int($4); start=int($2); end=int($3);
+                 if (size > max) {max=size; max_start=start; max_end=end}
+               }
+               END {
+                 if (max > 0) printf "%d %d %d\n", max, max_start, max_end;
+               }')
+  free_mib=$(awk '{print $1}' <<< "${free_segment_info}")
+  free_start_mib=$(awk '{print $2}' <<< "${free_segment_info}")
+  free_end_mib=$(awk '{print $3}' <<< "${free_segment_info}")
+
+  if [[ -z "${free_mib}" || -z "${free_start_mib}" || -z "${free_end_mib}" ]]; then
+    log "[ERROR] Could not determine free segment on ${os_disk}. Aborting."
+    return 1
+  fi
+  if [[ "${free_mib}" -lt "${required_partition_mib}" ]]; then
+    log "[ERROR] Insufficient unallocated space on ${os_disk}: required=${required_partition_mib}MiB, available=${free_mib}MiB."
+    return 1
+  fi
+
+  local new_part_end_mib
+  new_part_end_mib=$((free_start_mib + required_partition_mib - 1))
+  if [[ "${new_part_end_mib}" -gt "${free_end_mib}" ]]; then
+    log "[ERROR] Computed partition end exceeds free segment boundary on ${os_disk}. Aborting."
+    return 1
+  fi
+
+  local before_parts after_parts new_os_pv_partition
+  before_parts=$(lsblk -ln -o NAME "${os_disk}" 2>/dev/null | awk 'NR>1 {print "/dev/"$1}' | sort -u)
+
+  run_cmd "sudo parted -s ${os_disk} -- mkpart primary ${free_start_mib}MiB ${new_part_end_mib}MiB"
+  run_cmd "sudo partprobe ${os_disk}"
+  run_cmd "sudo udevadm settle"
+
+  if [[ "${DRY_RUN}" -eq 1 ]]; then
+    new_os_pv_partition="${os_disk}<new-partition>"
+  else
+    local _wait_try
+    for _wait_try in {1..20}; do
+      after_parts=$(lsblk -ln -o NAME "${os_disk}" 2>/dev/null | awk 'NR>1 {print "/dev/"$1}' | sort -u)
+      new_os_pv_partition=$(comm -13 <(printf '%s\n' "${before_parts}") <(printf '%s\n' "${after_parts}") | awk 'NF {print $1; exit}')
+      if [[ -n "${new_os_pv_partition}" && -b "${new_os_pv_partition}" ]]; then
+        break
+      fi
+      sleep 0.3
+    done
+    if [[ -z "${new_os_pv_partition}" || ! -b "${new_os_pv_partition}" ]]; then
+      log "[ERROR] Failed to detect newly created partition on ${os_disk}. Aborting."
+      return 1
+    fi
+  fi
+
+  log "[${step_label}] New OS-disk partition detected: ${new_os_pv_partition}"
+  run_cmd "sudo pvcreate ${new_os_pv_partition}"
+  run_cmd "sudo vgextend ${ubuntu_vg} ${new_os_pv_partition}"
+
+  vg_free_mib=$(sudo vgs --noheadings --units m --nosuffix -o vg_free "${ubuntu_vg}" 2>/dev/null \
+    | lvm_floor_units)
+  [[ -z "${vg_free_mib}" ]] && vg_free_mib=0
+  if [[ "${DRY_RUN:-1}" -eq 1 ]]; then
+    log "[DRY-RUN] VG expansion simulated; no partition, PV, or VG was created."
+    return 0
+  fi
+  if [[ "${vg_free_mib}" -lt "${required_lv_mib}" ]]; then
+    log "[ERROR] ${ubuntu_vg} free space is still insufficient after vgextend (${vg_free_mib}MiB < ${required_lv_mib}MiB)."
+    return 1
+  fi
+
+  log "[${step_label}] ${ubuntu_vg} successfully expanded (free=${vg_free_mib}MiB)."
+  return 0
+}
+
+
+validate_downloaded_shell_script() {
+  local script_path="$1"
+
+  [[ -s "${script_path}" ]] || return 1
+
+  if head -c 4096 "${script_path}" 2>/dev/null \
+      | LC_ALL=C grep -Eiq '<!doctype[[:space:]]+html|<html([[:space:]>])|<head([[:space:]>])|404[[:space:]]+not[[:space:]]+found|access[[:space:]]+denied|unauthorized|authentication[[:space:]]+required'; then
+    return 1
+  fi
+
+  if ! head -n 1 "${script_path}" 2>/dev/null \
+      | grep -Eq '^#![[:space:]]*/.*(bash|sh)([[:space:]]|$)'; then
+    return 1
+  fi
+
+  bash -n "${script_path}" >/dev/null 2>&1
+}
+
+
+validate_qcow2_image() {
+  local image_path="$1"
+
+  [[ -s "${image_path}" ]] || return 1
+
+  # Reject obviously invalid tiny responses such as HTML/XML error pages.
+  local image_size
+  image_size=$(stat -c '%s' "${image_path}" 2>/dev/null || echo 0)
+  [[ "${image_size}" =~ ^[0-9]+$ ]] || return 1
+  (( image_size >= 1048576 )) || return 1
+
+  if command -v qemu-img >/dev/null 2>&1; then
+    qemu-img info "${image_path}" >/dev/null 2>&1 || return 1
+  fi
+
+  return 0
+}
+
+
+validate_sensor_qcow2_candidate() {
+  local image_path="$1"
+  local sensor_version="$2"
+  local expected_name="aella-modular-ds-${sensor_version}.qcow2"
+  local actual_name
+  local image_format
+
+  actual_name="$(basename -- "${image_path}")"
+  [[ "${actual_name}" == "${expected_name}" ]] || return 1
+  validate_qcow2_image "${image_path}" || return 1
+
+  command -v qemu-img >/dev/null 2>&1 || return 1
+  image_format=$(LC_ALL=C qemu-img info "${image_path}" 2>/dev/null     | awk -F': ' '/^file format:/ {print $2; exit}')
+  [[ "${image_format}" == "qcow2" ]] || return 1
+
+  return 0
+}
+
+
+installer_vm_budget_check() {
+  local role="$1" vm_cpus="$2" vm_mem_gb="$3" peer_cpus="${4:-0}" peer_mem_gb="${5:-0}"
+  local v host_cpus host_mem_gb keep_cpus keep_mem_gb
+  for v in "${vm_cpus}" "${vm_mem_gb}" "${peer_cpus}" "${peer_mem_gb}"; do
+    [[ "${v}" =~ ^(0|[1-9][0-9]{0,5})$ ]] || { log "[ERROR] ${role}: invalid resource value '${v}'"; return 1; }
+  done
+  if (( vm_cpus < 1 || vm_mem_gb < 1 )); then
+    log "[ERROR] ${role}: vCPU and RAM allocations must be positive"
+    return 1
+  fi
+  host_cpus=$(getconf _NPROCESSORS_ONLN 2>/dev/null || nproc 2>/dev/null || echo 0)
+  host_mem_gb=$(awk '/^MemTotal:/ {print int($2 / 1048576); exit}' /proc/meminfo)
+  if [[ ! "${host_cpus}" =~ ^[1-9][0-9]*$ || ! "${host_mem_gb}" =~ ^[1-9][0-9]*$ ]]; then
+    log "[ERROR] ${role}: host resource discovery failed"
+    return 1
+  fi
+  keep_cpus=4
+  (( host_cpus < 8 )) && keep_cpus=2
+  (( host_cpus < 4 )) && keep_cpus=1
+  keep_mem_gb=$(( (host_mem_gb * 12 + 99) / 100 ))
+  (( keep_mem_gb < 4 )) && keep_mem_gb=4
+  if (( vm_cpus + peer_cpus > host_cpus - keep_cpus ||
+        vm_mem_gb + peer_mem_gb > host_mem_gb - keep_mem_gb )); then
+    log "[ERROR] ${role}: requested ${vm_cpus}+${peer_cpus} vCPU, ${vm_mem_gb}+${peer_mem_gb} GiB; host budget ${host_cpus}-${keep_cpus} vCPU, ${host_mem_gb}-${keep_mem_gb} GiB"
+    return 1
+  fi
+  log "[PREFLIGHT] ${role}: vCPU/RAM budget verified"
+  return 0
+}
+
+
+# Download to a staging path and replace only after artifact validation.
+installer_download_validated() {
+  local url="$1" destination="$2" kind="$3" tmp="${2}.part.$" image_format
+  if ! curl --fail --show-error --location --retry 3 --retry-delay 2 \
+       --connect-timeout 20 --user "${ACPS_USERNAME}:${ACPS_PASSWORD}" \
+       --output "${tmp}" "${url}"; then
+    rm -f -- "${tmp}" 2>/dev/null || true
+    log "[ERROR] Artifact download failed: ${url}"
+    return 1
+  fi
+  if [[ "${kind}" == "script" ]]; then
+    if ! validate_downloaded_shell_script "${tmp}"; then
+      rm -f -- "${tmp}"; log "[ERROR] Invalid shell script download"; return 1
+    fi
+  elif [[ "${kind}" == "image" ]]; then
+    if ! validate_qcow2_image "${tmp}" || ! command -v qemu-img >/dev/null 2>&1; then
+      rm -f -- "${tmp}"; log "[ERROR] Invalid Sensor image download"; return 1
+    fi
+    image_format=$(LC_ALL=C qemu-img info "${tmp}" 2>/dev/null | awk -F': ' '/^file format:/ {print $2; exit}')
+    if [[ "${image_format}" != "qcow2" ]]; then
+      rm -f -- "${tmp}"; log "[ERROR] Download is not a qcow2 image"; return 1
+    fi
+  else
+    rm -f -- "${tmp}"; return 1
+  fi
+  mv -f -- "${tmp}" "${destination}" || { rm -f -- "${tmp}"; return 1; }
+}
+
+# Compare mount source by block device identity, not /dev/mapper vs /dev/VG/LV spelling.
+installer_same_device() {
+  local x y
+  x=$(lsblk -dn -o MAJ:MIN "$(readlink -f "$1")" 2>/dev/null | awk 'NF {print $1; exit}')
+  y=$(lsblk -dn -o MAJ:MIN "$(readlink -f "$2")" 2>/dev/null | awk 'NF {print $1; exit}')
+  [[ -n "${x}" && "${x}" == "${y}" ]]
 }
 
 append_fstab_if_missing() {
@@ -1518,6 +1766,12 @@ run_step() {
       rc=1
       ;;
   esac
+
+  if [[ "${rc}" -eq 2 ]]; then
+    RUN_STEP_STATUS="CANCELED"
+    log "===== STEP CANCELED: ${step_id} - ${step_name} ====="
+    return 0
+  fi
 
   if [[ "${rc}" -eq 0 ]]; then
     RUN_STEP_STATUS="DONE"
@@ -2748,9 +3002,9 @@ step_02_hwe_kernel() {
   hwe_installed="no"
   hwe_status_detail="not installed"
   
-  if dpkg -l 2>/dev/null | grep hwe | grep -q "linux-image-generic-hwe-24.04"; then
+  if dpkg-query -W -f='${Status}\n' "${pkg_name}" 2>/dev/null | grep -qx 'install ok installed'; then
     hwe_installed="yes"
-    hwe_status_detail="HWE kernel installed (linux-image-generic-hwe-24.04)"
+    hwe_status_detail="Kernel package installed (${pkg_name})"
   fi
 
   {
@@ -2819,7 +3073,7 @@ step_02_hwe_kernel() {
   if ! whiptail_yesno "STEP 02 Execution Confirmation" "Do you want to proceed?\n\n(Yes: Continue / No: Cancel)" 12 70
   then
     log "User canceled STEP 02 execution."
-    return 0
+    return 2
   fi
 
 
@@ -2873,9 +3127,9 @@ step_02_hwe_kernel() {
     hwe_now_detail="not installed"
     
     # Re-check HWE status: Check if linux-image-generic-hwe-24.04 is installed via dpkg -l | grep hwe
-    if dpkg -l 2>/dev/null | grep hwe | grep -q "linux-image-generic-hwe-24.04"; then
+    if dpkg-query -W -f='${Status}\n' "${pkg_name}" 2>/dev/null | grep -qx 'install ok installed'; then
       hwe_now="yes"
-      hwe_now_detail="HWE kernel installed (linux-image-generic-hwe-24.04)"
+      hwe_now_detail="Kernel package installed (${pkg_name})"
     fi
   fi
 
@@ -5230,8 +5484,8 @@ step_07_sensor_download() {
   root_lv_name=$(basename "${root_dev}" 2>/dev/null || true)
   OS_UBUNTU_VG=$(sudo lvs --noheadings -o vg_name "${root_dev}" 2>/dev/null | awk '{print $1}')
   if [[ -z "${OS_UBUNTU_VG}" ]]; then
-    OS_UBUNTU_VG="ubuntu-vg"
-    log "[WARN] Could not detect OS VG from root device; fallback to ${OS_UBUNTU_VG}"
+    log "[ERROR] Root filesystem is not on an identifiable LVM VG; refusing to guess ubuntu-vg."
+    return 1
   else
     log "[STEP 07] Detected OS VG: ${OS_UBUNTU_VG} (root=${root_dev})"
   fi
@@ -5241,19 +5495,10 @@ step_07_sensor_download() {
   local SENSOR_IMAGE_DIR="${SENSOR_INSTALL_DIR}/images"
   local SENSOR_VM_DIR="${SENSOR_IMAGE_DIR}/${SENSOR_VM}"
 
-  # If an existing Sensor VM is present, require explicit typed confirmation before removal.
+  # STEP 07 prepares LV and downloads images without deleting an existing VM.
+  # STEP 08 owns VM redeployment and its exact-name destructive confirmation.
   if virsh dominfo "${SENSOR_VM}" >/dev/null 2>&1; then
-    if ! confirm_destroy_vm "${SENSOR_VM}" "STEP 07 - Sensor Image/LV Preparation"; then
-      log "[STEP 07] Existing ${SENSOR_VM} VM was kept; destructive preparation canceled."
-      return 0
-    fi
-
-    log "[STEP 07] Exact confirmation received. Destroying and undefining ${SENSOR_VM} before LVM configuration."
-    run_cmd "virsh destroy ${SENSOR_VM} || true"
-    run_cmd "virsh undefine ${SENSOR_VM} --remove-all-storage || virsh undefine ${SENSOR_VM} || true"
-    if [[ -d "${SENSOR_VM_DIR}" ]]; then
-      run_cmd "sudo rm -rf ${SENSOR_VM_DIR}"
-    fi
+    log "[STEP 07] Existing Sensor VM preserved while preparing storage and images."
   fi
 
   # User Configuration  (OpenXDR Method: ubuntu-vg use)
@@ -5262,27 +5507,17 @@ step_07_sensor_download() {
   #######################################
   # 0) Get LV Size from user input
   #######################################
-  # Check ubuntu-vg total size and available space
-  local ubuntu_vg_total_size ubuntu_lv_size ubuntu_lv_gb available_gb
-  ubuntu_vg_total_size=$(vgs "${OS_UBUNTU_VG}" --noheadings --units g --nosuffix -o size 2>/dev/null | tr -d ' ' || echo "0")
-  
-  if command -v lvs >/dev/null 2>&1; then
-    if [[ -n "${root_lv_name}" ]]; then
-      ubuntu_lv_size=$(lvs "${OS_UBUNTU_VG}/${root_lv_name}" --noheadings --units g --nosuffix -o lv_size 2>/dev/null | tr -d ' ' || echo "0")
-    else
-      ubuntu_lv_size="0"
-    fi
-    ubuntu_lv_gb=${ubuntu_lv_size%.*}
-  else
-    ubuntu_lv_gb=0
+  # Use actual free VG extents: VG total minus only the root LV is inaccurate.
+  local ubuntu_vg_total_size ubuntu_vg_free_size available_gb
+  ubuntu_vg_total_size=$(vgs "${OS_UBUNTU_VG}" --noheadings --units g --nosuffix -o vg_size 2>/dev/null | awk 'NF {print $1; exit}')
+  ubuntu_vg_free_size=$(vgs "${OS_UBUNTU_VG}" --noheadings --units g --nosuffix -o vg_free 2>/dev/null | awk 'NF {print $1; exit}')
+  if [[ -z "${ubuntu_vg_total_size}" || -z "${ubuntu_vg_free_size}" ]]; then
+    log "[ERROR] Cannot obtain available VG storage."
+    return 1
   fi
-  
-  local ubuntu_vg_total_gb=${ubuntu_vg_total_size%.*}
-  available_gb=$((ubuntu_vg_total_gb - ubuntu_lv_gb))
-  [[ ${available_gb} -lt 0 ]] && available_gb=0
-  
-  local disk_info_msg="Disk Information:\n- ubuntu-vg Total Size: ${ubuntu_vg_total_size}GB\n- System use (ubuntu-lv): ${ubuntu_lv_size}GB\n- Available: approximately ${available_gb}GB\n\n"
-  
+  available_gb=${ubuntu_vg_free_size%.*}
+  local disk_info_msg="Disk information:\n- Root VG: ${OS_UBUNTU_VG}\n- Total: ${ubuntu_vg_total_size}GiB\n- Free extents: ${ubuntu_vg_free_size}GiB\n\n"
+
   # Host Sensor LV default. The VM virtual disk is configured separately in STEP 08.
   local default_sensor_lv_gb=400
   local lv_size_gb
@@ -5397,97 +5632,8 @@ step_07_sensor_download() {
       vg_free_mib=$(sudo vgs --noheadings --units m --nosuffix -o vg_free "${UBUNTU_VG}" 2>/dev/null | awk 'NF {print int($1); exit}')
       [[ -z "${vg_free_mib}" ]] && vg_free_mib=0
 
-      if [[ "${vg_free_mib}" -lt "${required_lv_mib}" ]]; then
-        log "[STEP 07] ${UBUNTU_VG} free space is insufficient (${vg_free_mib}MiB < ${required_lv_mib}MiB). Expanding VG from OS disk free area."
-
-        local root_pv os_disk_base os_disk
-        root_pv=$(sudo lvs --noheadings -o devices "${root_dev}" 2>/dev/null | awk -F'[(), ]+' 'NF {print $1; exit}')
-        if [[ -z "${root_pv}" ]]; then
-          root_pv=$(sudo pvs --noheadings -o pv_name --select "vg_name=${UBUNTU_VG}" 2>/dev/null | awk 'NF {print $1; exit}')
-        fi
-        if [[ -z "${root_pv}" ]]; then
-          log "[ERROR] Failed to detect root PV for ${UBUNTU_VG}. Cannot continue safely."
-          return 1
-        fi
-
-        os_disk_base=$(lsblk -no PKNAME "${root_pv}" 2>/dev/null | awk 'NF {print $1; exit}')
-        if [[ -z "${os_disk_base}" ]]; then
-          os_disk_base=$(basename "${root_pv}")
-        fi
-        os_disk="/dev/${os_disk_base}"
-
-        if [[ ! -b "${os_disk}" ]]; then
-          log "[ERROR] Detected OS disk is invalid: ${os_disk}. Aborting."
-          return 1
-        fi
-
-        local required_partition_mib free_segment_info free_mib free_start_mib free_end_mib
-        required_partition_mib=$((required_lv_mib + 1024))  # 1GiB metadata/safety buffer
-        free_segment_info=$(sudo parted -m "${os_disk}" unit MiB print free 2>/dev/null \
-          | awk -F: '$1 ~ /^[0-9]+$/ && $NF ~ /free;$/ {
-                       gsub("MiB","",$2); gsub("MiB","",$3); gsub("MiB","",$4);
-                       size=int($4); start=int($2); end=int($3);
-                       if (size > max) {max=size; max_start=start; max_end=end}
-                     }
-                     END {
-                       if (max > 0) printf "%d %d %d\n", max, max_start, max_end;
-                     }')
-        free_mib=$(awk '{print $1}' <<< "${free_segment_info}")
-        free_start_mib=$(awk '{print $2}' <<< "${free_segment_info}")
-        free_end_mib=$(awk '{print $3}' <<< "${free_segment_info}")
-
-        if [[ -z "${free_mib}" || -z "${free_start_mib}" || -z "${free_end_mib}" ]]; then
-          log "[ERROR] Could not determine free segment on ${os_disk}. Aborting."
-          return 1
-        fi
-        if [[ "${free_mib}" -lt "${required_partition_mib}" ]]; then
-          log "[ERROR] Insufficient unallocated space on ${os_disk}: required=${required_partition_mib}MiB, available=${free_mib}MiB."
-          return 1
-        fi
-
-        local new_part_end_mib
-        new_part_end_mib=$((free_start_mib + required_partition_mib - 1))
-        if [[ "${new_part_end_mib}" -gt "${free_end_mib}" ]]; then
-          log "[ERROR] Computed partition end exceeds free segment boundary on ${os_disk}. Aborting."
-          return 1
-        fi
-
-        local before_parts after_parts new_os_pv_partition
-        before_parts=$(lsblk -ln -o NAME "${os_disk}" 2>/dev/null | awk 'NR>1 {print "/dev/"$1}' | sort -u)
-        run_cmd "sudo parted -s ${os_disk} -- mkpart primary ${free_start_mib}MiB ${new_part_end_mib}MiB"
-        run_cmd "sudo partprobe ${os_disk}"
-        run_cmd "sudo udevadm settle"
-
-        if [[ "${DRY_RUN}" -eq 1 ]]; then
-          new_os_pv_partition="${os_disk}<new-partition>"
-        else
-          local _wait_try
-          for _wait_try in {1..20}; do
-            after_parts=$(lsblk -ln -o NAME "${os_disk}" 2>/dev/null | awk 'NR>1 {print "/dev/"$1}' | sort -u)
-            new_os_pv_partition=$(comm -13 <(printf '%s\n' "${before_parts}") <(printf '%s\n' "${after_parts}") | awk 'NF {print $1; exit}')
-            if [[ -n "${new_os_pv_partition}" && -b "${new_os_pv_partition}" ]]; then
-              break
-            fi
-            sleep 0.3
-          done
-          if [[ -z "${new_os_pv_partition}" || ! -b "${new_os_pv_partition}" ]]; then
-            log "[ERROR] Failed to detect newly created partition on ${os_disk}. Aborting."
-            return 1
-          fi
-        fi
-
-        log "[STEP 07] New OS-disk partition detected: ${new_os_pv_partition}"
-        run_cmd "sudo pvcreate ${new_os_pv_partition}"
-        run_cmd "sudo vgextend ${UBUNTU_VG} ${new_os_pv_partition}"
-
-        vg_free_mib=$(sudo vgs --noheadings --units m --nosuffix -o vg_free "${UBUNTU_VG}" 2>/dev/null | awk 'NF {print int($1); exit}')
-        [[ -z "${vg_free_mib}" ]] && vg_free_mib=0
-        if [[ "${vg_free_mib}" -lt "${required_lv_mib}" ]]; then
-          log "[ERROR] ${UBUNTU_VG} free space is still insufficient after vgextend (${vg_free_mib}MiB < ${required_lv_mib}MiB)."
-          return 1
-        fi
-
-        log "[STEP 07] ${UBUNTU_VG} successfully expanded (free=${vg_free_mib}MiB)."
+      if ! ensure_ubuntu_vg_free_space "STEP 07" "${UBUNTU_VG}" "${root_dev}" "${required_lv_mib}" 1024; then
+        return 1
       fi
 
       log "[STEP 07] Creating lv_sensor_root LV in existing ${UBUNTU_VG}"
@@ -5511,7 +5657,7 @@ step_07_sensor_download() {
     local mounted_device=""
     if mountpoint -q "${mount_point}" 2>/dev/null; then
       mounted_device=$(findmnt -n -o SOURCE "${mount_point}" 2>/dev/null || echo "")
-      if [[ -n "${mounted_device}" && "${mounted_device}" != "/dev/${lv_path}" ]]; then
+      if [[ -z "${mounted_device}" ]] || ! installer_same_device "${mounted_device}" "/dev/${lv_path}"; then
         log "[ERROR] ${mount_point} is already mounted by ${mounted_device}, expected /dev/${lv_path}"
         whiptail_msgbox "STEP 07 - Mount Error" "${mount_point} is already mounted by a different device (${mounted_device}).\n\nPlease unmount it first or use a different mount point." 12 80
         return 1
@@ -5575,19 +5721,18 @@ step_07_sensor_download() {
   
   local search_dir="."
   
-  # 1GB(=1000M) this *.qcow2     File 1unit Selection (OpenXDR Method)
-  local_qcow="$(
-    find "${search_dir}" -maxdepth 1 -type f -name '*.qcow2' -size +1000M -printf '%T@ %p\n' 2>/dev/null \
-      | sort -nr \
-      | head -n1 \
-      | awk '{print $2}'
-  )"
-  
+  # Only an exact-version, validated Sensor image may be reused.
+  local_qcow="${search_dir}/${qcow2_name}"
+  if ! validate_sensor_qcow2_candidate "${local_qcow}" "${SENSOR_VERSION}"; then
+    [[ -e "${local_qcow}" ]] && log "[WARN] Local Sensor qcow2 invalid; requiring verified download."
+    local_qcow=""
+  fi
+
   if [[ -n "${local_qcow}" ]]; then
     local_qcow_size_h="$(ls -lh "${local_qcow}" 2>/dev/null | awk '{print $5}')"
     
     local msg
-    msg="Found qcow2 file larger than 1GB in current directory.\n\n"
+    msg="Found exact-version validated Sensor qcow2 in current directory.\n\n"
     msg+="  File: ${local_qcow}\n"
     msg+="  Size: ${local_qcow_size_h}\n\n"
     msg+="Do you want to use this file for Sensor VM deployment without downloading?\n\n"
@@ -5612,7 +5757,7 @@ step_07_sensor_download() {
           if [[ "${DRY_RUN}" -eq 1 ]]; then
             log "[DRY-RUN] sudo rm -f ${existing_qcow2}"
           else
-            run_cmd "sudo rm -f ${existing_qcow2}"
+            log "[INFO] Preserved previously downloaded image: ${existing_qcow2}"
             log "[STEP 07] Old version qcow2 file removed: ${existing_qcow2}"
           fi
         else
@@ -5624,14 +5769,21 @@ step_07_sensor_download() {
       if [[ "${DRY_RUN}" -eq 1 ]]; then
         log "[DRY-RUN] sudo cp \"${local_qcow}\" \"${SENSOR_IMAGE_DIR}/${qcow2_name}\""
       else
-        run_cmd "sudo cp \"${local_qcow}\" \"${SENSOR_IMAGE_DIR}/${qcow2_name}\""
+        local image_tmp="${SENSOR_IMAGE_DIR}/.${qcow2_name}.part.$"
+        if ! cp --reflink=auto -- "${local_qcow}" "${image_tmp}" ||
+           ! validate_qcow2_image "${image_tmp}" ||
+           ! mv -f -- "${image_tmp}" "${SENSOR_IMAGE_DIR}/${qcow2_name}"; then
+          rm -f -- "${image_tmp}" 2>/dev/null || true
+          log "[ERROR] Failed to stage verified Sensor image"
+          return 1
+        fi
         log "[STEP 07] Local qcow2 copied to ${SENSOR_IMAGE_DIR}/${qcow2_name} (completed)"
       fi
     else
       log "[STEP 07] User chose not to use local qcow2, will use existing file/download."
     fi
   else
-    log "[STEP 07] No local qcow2 file (1GB+) found -> using default download/existing file."
+    log "[STEP 07] No validated local Sensor qcow2 found -> using default download/existing file."
   fi
   
   #######################################
@@ -5662,14 +5814,18 @@ step_07_sensor_download() {
         if [[ "${DRY_RUN}" -eq 1 ]]; then
           log "[DRY-RUN] sudo rm -f ${existing_qcow2}"
         else
-          run_cmd "sudo rm -f ${existing_qcow2}"
+          log "[INFO] Preserved previously downloaded image: ${existing_qcow2}"
           log "[STEP 07] Old version qcow2 file removed: ${existing_qcow2}"
         fi
         # Keep need_qcow2=1 to download new version
       else
         log "[STEP 07] Existing qcow2 file with same version found: ${existing_qcow2} (version: ${existing_version})"
-        log "[STEP 07] Skipping download - using existing file"
-        need_qcow2=0
+        if validate_sensor_qcow2_candidate "${SENSOR_IMAGE_DIR}/${qcow2_name}" "${SENSOR_VERSION}"; then
+          log "[STEP 07] Skipping download - verified existing Sensor qcow2"
+          need_qcow2=0
+        else
+          log "[WARN] Existing Sensor qcow2 invalid; downloading verified replacement"
+        fi
       fi
     fi
     
@@ -5691,7 +5847,7 @@ step_07_sensor_download() {
         if [[ "${DRY_RUN}" -eq 1 ]]; then
           log "[DRY-RUN] sudo rm -f ${existing_qcow2}"
         else
-          run_cmd "sudo rm -f ${existing_qcow2}"
+          log "[INFO] Preserved previously downloaded image: ${existing_qcow2}"
           log "[STEP 07] Old version qcow2 file removed: ${existing_qcow2}"
         fi
       fi
@@ -5720,45 +5876,18 @@ step_07_sensor_download() {
       log "[STEP 07] Using local qcow2 -> downloading script only."
     fi
     
-    (
-      cd "${SENSOR_IMAGE_DIR}" || exit 1
-      
-      # 1) Deployment script Download ()
-      log "[STEP 07] Starting ${script_name} download: ${script_url}"
-      echo "=== Deployment script download in progress ==="
-      if wget --progress=bar:force --user="${ACPS_USERNAME}" --password="${ACPS_PASSWORD}" "${script_url}" 2>&1 | tee -a "${LOG_FILE}"; then
-        chmod +x "${script_name}"
-        echo "=== Deployment script download completed ==="
-        log "[STEP 07] ${script_name} download completed"
-      else
-        log "[ERROR] ${script_name} Download Failed"
-        exit 1
-      fi
-      
-      # 2) Download qcow2 image (skip if local qcow2 is being used)
-      if [[ "${need_qcow2}" -eq 1 ]]; then
-        # Remove existing qcow2 file if it exists (different version or same)
-        if [[ -f "${qcow2_name}" ]]; then
-          log "[STEP 07] Removing existing qcow2 file before download: ${qcow2_name}"
-          rm -f "${qcow2_name}"
-        fi
-        
-        log "[STEP 07] Starting ${qcow2_name} download: ${image_url}"
-        echo "=== ${qcow2_name} download in progress (large file, this may take some time) ==="
-        echo "File size may be large, please wait..."
-        if wget --progress=bar:force --user="${ACPS_USERNAME}" --password="${ACPS_PASSWORD}" "${image_url}" 2>&1 | tee -a "${LOG_FILE}"; then
-          echo "=== ${qcow2_name} download completed ==="
-          log "[STEP 07] ${qcow2_name} download completed"
-        else
-          log "[ERROR] ${qcow2_name} Download Failed"
-          exit 1
-        fi
-      fi
-    ) || {
-      log "[ERROR] Error occurred during ACPS download"
+    if ! installer_download_validated "${script_url}" "${SENSOR_IMAGE_DIR}/${script_name}" script; then
+      log "[ERROR] Invalid or incomplete Sensor deployment script download"
       return 1
-    }
-    
+    fi
+    chmod 0755 "${SENSOR_IMAGE_DIR}/${script_name}" || return 1
+    if [[ "${need_qcow2}" -eq 1 ]]; then
+      if ! installer_download_validated "${image_url}" "${SENSOR_IMAGE_DIR}/${qcow2_name}" image; then
+        log "[ERROR] Invalid or incomplete Sensor image download; old image preserved"
+        return 1
+      fi
+    fi
+
     log "[STEP 07] Sensor image and script download completed"
   fi
 
@@ -5917,6 +6046,9 @@ step_08_sensor_deploy() {
   [[ ${default_sensor_vcpus} -lt 2 ]] && default_sensor_vcpus=2
   
   local default_sensor_disk_gb=350
+  if [[ "${LV_SIZE_GB:-}" =~ ^[0-9]+$ ]] && (( LV_SIZE_GB >= 100 && LV_SIZE_GB < 380 )); then
+    default_sensor_disk_gb=$((LV_SIZE_GB - 30))
+  fi
   
   # Use existing values if set, otherwise use calculated defaults
   : "${SENSOR_MEMORY_MB:=}"
@@ -6010,6 +6142,15 @@ step_08_sensor_deploy() {
   local mem_mb=$(( sensor_mem_gb * 1024 ))
   local cpus="${sensor_vcpus}"
   local disksize="${sensor_disk_gb}"
+  if [[ ! "${LV_SIZE_GB:-}" =~ ^[0-9]+$ ]] || (( disksize + 30 > LV_SIZE_GB )); then
+    log "[ERROR] Sensor VM disk ${disksize}GiB must fit in ${LV_SIZE_GB:-unknown}GiB host LV with at least 30GiB headroom."
+    whiptail_msgbox "STEP 08 - Storage capacity" "VM disk: ${disksize}GiB\nHost LV: ${LV_SIZE_GB:-unknown}GiB\n\nReserve at least 30GiB for the host filesystem." 15 80
+    return 1
+  fi
+  if ! installer_vm_budget_check "Sensor" "${cpus}" "${sensor_mem_gb}"; then
+    whiptail_msgbox "STEP 08 - Insufficient host resources" "Requested Sensor vCPU/RAM allocation exceeds available KVM host capacity." 14 80
+    return 1
+  fi
 
   # 4) Bridge Mode: IP Configuration (if bridge mode)
   local sensor_ip sensor_netmask sensor_gateway sensor_dns
