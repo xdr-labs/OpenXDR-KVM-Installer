@@ -7448,19 +7448,14 @@ Run virt_deploy_uvp_centos.sh with these settings?"
         if [ "${deploy_rc}" -eq 0 ]; then
             echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 09] AIO VM deployment completed successfully."
             
-            # Apply CPU affinity to NUMA0
-            if [[ -n "${NUMA_NODES:-}" && "${NUMA_NODES}" -gt 1 ]]; then
-                log "[STEP 09] Applying CPU affinity to NUMA0 for AIO VM"
+            # Apply persistent NUMA0 CPU + strict memory affinity immediately.
+            # STEP 12 also reapplies after SPAN changes and restarts both VMs.
+            if (( numa_nodes >= 2 )); then
                 local numa0_cpus
-                numa0_cpus=$(lscpu | grep "NUMA node0 CPU(s):" | sed 's/NUMA node0 CPU(s)://' | tr -d '[:space:]')
-                if [[ -n "${numa0_cpus}" ]]; then
-                    virsh emulatorpin "${AIO_HOSTNAME}" "${numa0_cpus}" --config >/dev/null 2>&1 || true
-                    local max_vcpus
-                    max_vcpus="$(virsh vcpucount "${AIO_HOSTNAME}" --maximum --config 2>/dev/null || echo 0)"
-                    for (( i=0; i<max_vcpus; i++ )); do
-                        virsh vcpupin "${AIO_HOSTNAME}" "${i}" "${numa0_cpus}" --config >/dev/null 2>&1 || true
-                    done
-                    log "[STEP 09] CPU affinity applied to NUMA0 (cpuset=${numa0_cpus})"
+                numa0_cpus=$(numa_node_cpu_list 0) || return 1
+                if ! numa_apply_vm_policy "${AIO_HOSTNAME}" 0; then
+                    log "[ERROR] STEP 09: NUMA0 policy application failed. Fix before STEP 12."
+                    return 1
                 fi
             fi
             
@@ -7504,7 +7499,7 @@ Run virt_deploy_uvp_centos.sh with these settings?"
                 echo "  • Install directory: ${AIO_INSTALL_DIR}"
                 echo "  • Image directory: ${AIO_IMAGE_DIR}"
                 echo
-                if [[ -n "${NUMA_NODES:-}" && "${NUMA_NODES}" -gt 1 ]]; then
+                if (( numa_nodes >= 2 )); then
                     echo "⚙️  CPU AFFINITY:"
                     echo "  • NUMA node: NUMA0"
                     if [[ -n "${numa0_cpus:-}" ]]; then
@@ -8871,12 +8866,8 @@ step_12_sensor_passthrough() {
     # Check NUMA count (use lscpu)
     ###########################################################################
     local numa_nodes=1
-    if command -v lscpu >/dev/null 2>&1; then
-        numa_nodes=$(lscpu | grep "^NUMA node(s):" | awk '{print $3}')
-    fi
-    [[ -z "${numa_nodes}" ]] && numa_nodes=1
-
-    log "[STEP 12] NUMA node count: ${numa_nodes}"
+    numa_nodes=$(numa_node_count)
+    log "[STEP 12] Online NUMA node count: ${numa_nodes}"
 
     ###########################################################################
     # common path
@@ -9096,82 +9087,19 @@ EOF
         fi
 
         #######################################################################
-        # 4. Apply CPU Affinity (multiple NUMA only) - mds uses NUMA1
+        # 4. Apply CPU and strict local memory policy to NUMA1.
         #######################################################################
-        if [[ "${numa_nodes}" -gt 1 ]]; then
-            log "[STEP 12] ${SENSOR_VM}: CPU Affinity application start"
-
-            local cpuset_for_vm="${SENSOR_CPUSET_MDS:-}"
-
-            if [[ -z "${cpuset_for_vm}" ]]; then
-                # Extract NUMA node1 CPU list for mds
-                local node1_cpus
-                node1_cpus=$(lscpu | grep "NUMA node1 CPU(s):" | sed 's/NUMA node1 CPU(s)://' | tr -d '[:space:]')
-                if [[ -n "${node1_cpus}" ]]; then
-                    cpuset_for_vm="${node1_cpus}"
-                else
-                    log "[WARN] ${SENSOR_VM}: Cannot retrieve NUMA node1 CPU list, cannot apply Affinity."
-                    cpuset_for_vm=""
-                fi
-            fi
-
-            if [[ -z "${cpuset_for_vm}" ]]; then
-                log "[WARN] ${SENSOR_VM}: Per VM CPUSET is empty, so skip Affinity"
-            else
-                # Convert cpuset string to array (e.g., "48,49,50" -> array with 48, 49, 50)
-                local cpu_arr=()
-                local c
-                for c in $(echo "${cpuset_for_vm}" | tr ',' ' '); do
-                    cpu_arr+=("${c}")
-                done
-
-                if [[ "${#cpu_arr[@]}" -eq 0 ]]; then
-                    log "[WARN] ${SENSOR_VM}: CPU array is empty, so skip Affinity"
-                else
-                    log "[ACTION] ${SENSOR_VM}: CPU Affinity configuration (CPU list: ${cpuset_for_vm})"
-                    
-                    # Get maximum vCPU count
-                    local max_vcpus
-                    max_vcpus="$(virsh vcpucount "${SENSOR_VM}" --maximum --config 2>/dev/null || echo 0)"
-                    max_vcpus=$(echo "${max_vcpus}" | tr -d '\n\r' | grep -o '[0-9]*' | head -1)
-                    [[ -z "${max_vcpus}" ]] && max_vcpus="0"
-
-                    if [[ "${max_vcpus}" -eq 0 ]]; then
-                        log "[WARN] ${SENSOR_VM}: Unable to determine vCPU count → skipping CPU Affinity"
-                    else
-                        # Limit vCPU count to available CPUs
-                        if [[ "${#cpu_arr[@]}" -lt "${max_vcpus}" ]]; then
-                            log "[WARN] ${SENSOR_VM}: CPU list count(${#cpu_arr[@]}) is less than maximum vCPU(${max_vcpus}). Limiting to ${#cpu_arr[@]} vCPUs."
-                            max_vcpus="${#cpu_arr[@]}"
-                        fi
-
-                        # Set emulatorpin to all CPUs in the list (for emulator thread)
-                        local emulator_cpuset
-                        emulator_cpuset=$(echo "${cpuset_for_vm}" | tr ' ' ',')
-                        if [[ "${_DRY}" -eq 0 ]]; then
-                            virsh emulatorpin "${SENSOR_VM}" "${emulator_cpuset}" --config >/dev/null 2>&1 || true
-                            
-                            # Pin each vCPU to individual pCPU
-                            local i
-                            for (( i=0; i<max_vcpus; i++ )); do
-                                local pcpu="${cpu_arr[$i]}"
-                                if virsh vcpupin "${SENSOR_VM}" "${i}" "${pcpu}" --config >/dev/null 2>&1; then
-                                    log "[STEP 12] ${SENSOR_VM}: vCPU ${i} -> pCPU ${pcpu} pin (--config) completed"
-                                else
-                                    log "[WARN] ${SENSOR_VM}: vCPU ${i} -> pCPU ${pcpu} pin failed"
-                                fi
-                            done
-                        else
-                            log "[DRY-RUN] ${SENSOR_VM}: emulatorpin cpuset=${emulator_cpuset} (not executed)"
-                            for (( i=0; i<max_vcpus; i++ )); do
-                                local pcpu="${cpu_arr[$i]}"
-                                log "[DRY-RUN] ${SENSOR_VM}: vcpupin ${i} ${pcpu} --config (not executed)"
-                            done
-                        fi
-                    fi
+        local cpuset_for_vm=""
+        if (( numa_nodes >= 2 )); then
+            cpuset_for_vm=$(numa_node_cpu_list 1) || {
+                log "[ERROR] ${SENSOR_VM}: NUMA1 topology unavailable."
+                return 1
+            }
+            if ! numa_apply_vm_policy "${SENSOR_VM}" 1; then
+                log "[ERROR] ${SENSOR_VM}: NUMA1 CPU/memory policy failed."
+                return 1
             fi
         fi
-    fi
 
         #######################################################################
         # 4.5 Safe restart to apply configuration
@@ -9300,133 +9228,35 @@ EOF
     done
 
     ###########################################################################
-    # Process AIO VM CPU Affinity (if multiple NUMA nodes)
+    # Process AIO CPU and strict local memory policy (NUMA0).
     ###########################################################################
-    log "[STEP 12] ===== Starting AIO VM CPU Affinity processing ====="
-    log "[STEP 12] NUMA nodes count: ${numa_nodes}"
-    if [[ "${numa_nodes}" -gt 1 ]]; then
-        log "[STEP 12] ----- AIO VM CPU Affinity processing start: aio -----"
-        
-        local AIO_VM="aio"
-        
-        # Check AIO VM existence
-        local actual_cpuset_aio=""
-        local cpuset_for_aio=""
-        
+    log "[STEP 12] ===== Starting AIO NUMA0 CPU/memory affinity processing ====="
+    local AIO_VM="aio"
+    local actual_cpuset_aio=""
+    local cpuset_for_aio=""
+    if (( numa_nodes >= 2 )); then
         if ! virsh dominfo "${AIO_VM}" >/dev/null 2>&1; then
-            log "[STEP 12] WARNING: AIO VM(${AIO_VM}) not found. Skip CPU affinity configuration."
+            log "[WARN] AIO VM not defined; NUMA0 binding cannot be applied."
         else
-            log "[STEP 12] ${AIO_VM}: CPU Affinity application start"
-            
-            cpuset_for_aio="${AIO_CPUSET:-}"
-            
-            if [[ -z "${cpuset_for_aio}" ]]; then
-                # Extract NUMA node0 CPU list for aio
-                local node0_cpus
-                node0_cpus=$(lscpu | grep "NUMA node0 CPU(s):" | sed 's/NUMA node0 CPU(s)://' | tr -d '[:space:]')
-                if [[ -n "${node0_cpus}" ]]; then
-                    cpuset_for_aio="${node0_cpus}"
-                else
-                    log "[WARN] ${AIO_VM}: Cannot retrieve NUMA node0 CPU list, cannot apply Affinity."
-                    cpuset_for_aio=""
-                fi
+            cpuset_for_aio=$(numa_node_cpu_list 0) || {
+                log "[ERROR] AIO: NUMA0 topology unavailable."
+                return 1
+            }
+            if ! numa_apply_vm_policy "${AIO_VM}" 0; then
+                log "[ERROR] AIO: NUMA0 CPU/memory policy failed."
+                return 1
             fi
-            
-            if [[ -z "${cpuset_for_aio}" ]]; then
-                log "[WARN] ${AIO_VM}: CPUSET is empty, so skip Affinity"
-            else
-                # Convert cpuset string to array (e.g., "0,2,4,6" -> array with 0, 2, 4, 6)
-                local cpu_arr=()
-                local c
-                for c in $(echo "${cpuset_for_aio}" | tr ',' ' '); do
-                    cpu_arr+=("${c}")
-                done
-
-                if [[ "${#cpu_arr[@]}" -eq 0 ]]; then
-                    log "[WARN] ${AIO_VM}: CPU array is empty, so skip Affinity"
-                else
-                    log "[ACTION] ${AIO_VM}: CPU Affinity configuration (CPU list: ${cpuset_for_aio})"
-                    
-                    # Safely stop if VM is running (for CPU affinity configuration)
-                    if virsh list --name | grep -q "^${AIO_VM}$"; then
-                        log "[STEP 12] ${AIO_VM}: Running → shutdown"
-                        virsh shutdown "${AIO_VM}" >/dev/null 2>&1 || true
-                        
-                        local t=0
-                        while virsh list --name | grep -q "^${AIO_VM}$"; do
-                            sleep 2
-                            t=$((t+2))
-                            if [[ $t -ge 120 ]]; then
-                                log "[WARN] ${AIO_VM}: shutdown timeout → destroy"
-                                virsh destroy "${AIO_VM}" >/dev/null 2>&1 || true
-                                break
-                            fi
-                        done
-                    fi
-                    
-                    # Get maximum vCPU count
-                    local max_vcpus
-                    max_vcpus="$(virsh vcpucount "${AIO_VM}" --maximum --config 2>/dev/null || echo 0)"
-                    max_vcpus=$(echo "${max_vcpus}" | tr -d '\n\r' | grep -o '[0-9]*' | head -1)
-                    [[ -z "${max_vcpus}" ]] && max_vcpus="0"
-
-                    if [[ "${max_vcpus}" -eq 0 ]]; then
-                        log "[WARN] ${AIO_VM}: Unable to determine vCPU count → skipping CPU Affinity"
-                    else
-                        # Limit vCPU count to available CPUs
-                        if [[ "${#cpu_arr[@]}" -lt "${max_vcpus}" ]]; then
-                            log "[WARN] ${AIO_VM}: CPU list count(${#cpu_arr[@]}) is less than maximum vCPU(${max_vcpus}). Limiting to ${#cpu_arr[@]} vCPUs."
-                            max_vcpus="${#cpu_arr[@]}"
-                        fi
-
-                        # Set emulatorpin to all CPUs in the list (for emulator thread)
-                        local emulator_cpuset
-                        emulator_cpuset=$(echo "${cpuset_for_aio}" | tr ' ' ',')
-                        if [[ "${_DRY}" -eq 0 ]]; then
-                            virsh emulatorpin "${AIO_VM}" "${emulator_cpuset}" --config >/dev/null 2>&1 || true
-                            
-                            # Pin each vCPU to individual pCPU
-                            local i
-                            for (( i=0; i<max_vcpus; i++ )); do
-                                local pcpu="${cpu_arr[$i]}"
-                                if virsh vcpupin "${AIO_VM}" "${i}" "${pcpu}" --config >/dev/null 2>&1; then
-                                    log "[STEP 12] ${AIO_VM}: vCPU ${i} -> pCPU ${pcpu} pin (--config) completed"
-                                else
-                                    log "[WARN] ${AIO_VM}: vCPU ${i} -> pCPU ${pcpu} pin failed"
-                                fi
-                            done
-                            log "[STEP 12] ${AIO_VM}: CPU Affinity applied to NUMA0 (CPU list: ${cpuset_for_aio})"
-                            
-                            # Get actual CPU affinity setting for display
-                            actual_cpuset_aio=$(virsh emulatorpin "${AIO_VM}" --config 2>/dev/null | grep "emulator: CPU Affinity" | sed 's/.*: //' || echo "")
-                            if [[ -z "${actual_cpuset_aio}" ]]; then
-                                actual_cpuset_aio="${emulator_cpuset}"
-                            fi
-                            
-                            # Save AIO_CPUSET to configuration
-                            AIO_CPUSET="${cpuset_for_aio}"
-                            if type save_config >/dev/null 2>&1; then
-                                save_config
-                            fi
-                        else
-                            log "[DRY-RUN] ${AIO_VM}: emulatorpin cpuset=${emulator_cpuset} (not executed)"
-                            for (( i=0; i<max_vcpus; i++ )); do
-                                local pcpu="${cpu_arr[$i]}"
-                                log "[DRY-RUN] ${AIO_VM}: vcpupin ${i} ${pcpu} --config (not executed)"
-                            done
-                            actual_cpuset_aio="${emulator_cpuset}"
-                        fi
-                        
-                        # Safe restart to apply configuration
-                        restart_vm_safely "${AIO_VM}"
-                    fi
-                fi
+            actual_cpuset_aio="${cpuset_for_aio}"
+            AIO_CPUSET="${cpuset_for_aio}"
+            if type save_config >/dev/null 2>&1; then save_config; fi
+            if ! restart_vm_safely "${AIO_VM}"; then
+                log "[ERROR] AIO: failed to restart with NUMA0 binding."
+                return 1
             fi
         fi
-        
-        log "[STEP 12] ----- AIO VM CPU Affinity processing completed: aio -----"
     fi
-    
+    log "[STEP 12] ----- AIO NUMA0 CPU/memory policy completed -----"
+
     #######################################################################
     # AIO data disk (LV) attach (vg_aio/lv_aio → vdb, --config)
     # This is done regardless of NUMA configuration
