@@ -3390,7 +3390,7 @@ step_01_hw_detect() {
   local all_disks
 
   # List all physical disks (exclude loop, ram; include only type disk)
-  all_disks=$(lsblk -d -n -o NAME,SIZE,MODEL,TYPE | awk '$4=="disk" {print $1, $2, $3}')
+  all_disks=$(lsblk -d -b -n -o NAME,SIZE,TYPE,RM,RO | awk '$3=="disk" && $4==0 && $5==0 && $2>0 {print $1}')
 
   if [[ -z "${all_disks}" ]]; then
     whiptail_msgbox "STEP 01 - Disk detection failed" "No physical disks found.\nCheck lsblk output." 12 70
@@ -3398,7 +3398,10 @@ step_01_hw_detect() {
   fi
 
   # Iterate over disks
-  while read -r d_name d_size d_model; do
+  local d_name d_size d_model
+  while read -r d_name; do
+    d_size=$(lsblk -dn -o SIZE "/dev/${d_name}" | awk 'NF {print $1; exit}')
+    d_model=$(lsblk -dn -o MODEL "/dev/${d_name}" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
     # Check if any child of the disk is mounted at /, /boot, or /boot/efi
     # Using lsblk -r (raw) to inspect all children mountpoints
     if lsblk "/dev/${d_name}" -r -o MOUNTPOINT | grep -qE "^(/|/boot|/boot/efi)$"; then
@@ -6097,7 +6100,7 @@ step_07_lvm_storage() {
 
     # List PVs on this disk (includes /dev/sdb, /dev/sdb1, etc.)
     pv_list_for_disk=$(sudo pvs --noheadings -o pv_name 2>/dev/null \
-                         | awk "\$1 ~ /^\\/dev\\/${disk}([0-9]+)?\$/ {print \$1}")
+                         | awk "\$1 ~ /^\\/dev\\/${disk}(p?[0-9]+)?\$/ {print \$1}")
 
     for pv in ${pv_list_for_disk}; do
       vg_name=$(sudo pvs --noheadings -o vg_name "${pv}" 2>/dev/null | awk '{print $1}')
@@ -6117,7 +6120,9 @@ step_07_lvm_storage() {
       fi
 
       # Remove PV metadata (force twice for orphaned PVs with missing VG metadata)
-      if ! sudo pvremove -y "${pv}" >/dev/null 2>&1; then
+      if [[ "${DRY_RUN}" -eq 1 ]]; then
+        run_cmd "sudo pvremove -y ${pv}"
+      elif ! sudo pvremove -y "${pv}" >/dev/null 2>&1; then
         log "[STEP 07] Normal pvremove failed on ${pv} → retry with --force --force"
         run_cmd "sudo pvremove --force --force -y ${pv} || true"
       else
@@ -6127,7 +6132,7 @@ step_07_lvm_storage() {
 
     # Wipe signatures on existing partitions first (LVM labels live on the partition,
     # typically near the 1MiB start; wiping only the whole-disk GPT is not enough)
-    for part in "/dev/${disk}"[0-9]*; do
+    for part in "/dev/${disk}"[0-9]* "/dev/${disk}"p[0-9]*; do
       [[ -b "${part}" ]] || continue
       log "[STEP 07] Running wipefs on ${part}"
       run_cmd "sudo wipefs -a ${part} || true"
@@ -6161,21 +6166,30 @@ step_07_lvm_storage() {
   done
   run_cmd "sudo udevadm settle || true"
 
-  # Wait for partition device nodes (e.g., /dev/sdb1) to appear
+  # Wait for partition device nodes (sdb1 or nvme0n1p1) to appear.
+  local first_partition
   for d in ${DATA_SSD_LIST}; do
-    for _ in {1..10}; do
-      [[ -b "/dev/${d}1" ]] && break
-      sleep 0.3
-    done
+    first_partition=$(disk_first_partition_path "${d}") || return 1
+    if [[ "${DRY_RUN}" -eq 0 ]]; then
+      for _ in {1..10}; do
+        [[ -b "${first_partition}" ]] && break
+        sleep 0.3
+      done
+      if [[ ! -b "${first_partition}" ]]; then
+        log "[ERROR] Newly created partition did not appear: ${first_partition}"
+        return 1
+      fi
+    fi
   done
 
   # New partitions may still expose stale LVM labels at the same 1MiB offset.
   # Clear signatures before pvcreate so orphaned metadata cannot block initialization.
   log "[STEP 07] Clear residual signatures on new partitions before pvcreate"
   for d in ${DATA_SSD_LIST}; do
-    if [[ -b "/dev/${d}1" ]]; then
-      run_cmd "sudo wipefs -a /dev/${d}1 || true"
-      run_cmd "sudo dd if=/dev/zero of=/dev/${d}1 bs=1M count=4 status=none conv=fsync || true"
+    first_partition=$(disk_first_partition_path "${d}") || return 1
+    if [[ "${DRY_RUN}" -eq 1 || -b "${first_partition}" ]]; then
+      run_cmd "sudo wipefs -a ${first_partition} || true"
+      run_cmd "sudo dd if=/dev/zero of=${first_partition} bs=1M count=4 status=none conv=fsync || true"
     fi
   done
   run_cmd "sudo vgscan --cache || true"
@@ -6189,7 +6203,8 @@ step_07_lvm_storage() {
   local pv_list=""
   local stripe_count=0
   for d in ${DATA_SSD_LIST}; do
-    pv_list+=" /dev/${d}1"
+    first_partition=$(disk_first_partition_path "${d}") || return 1
+    pv_list+=" ${first_partition}"
     ((stripe_count++))
   done
 
