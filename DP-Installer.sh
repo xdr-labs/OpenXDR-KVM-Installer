@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #
 # XDR Install Framework (SSH + Whiptail-based TUI)
-# Only the base framework is implemented; each STEP is still DRY-RUN.
+# Interactive host and VM deployment. DRY_RUN controls host-changing commands.
 
 set -euo pipefail
 
@@ -442,6 +442,60 @@ run_cmd_linkscan() {
     log "[ERROR] Link-scan command failed (exit code: ${exit_code}): ${cmd}"
   fi
   return "${exit_code}"
+}
+
+# Cross-installer preflight. Each installer remains independently downloadable.
+installer_partition_one() {
+  local disk="${1#/dev/}"
+  [[ "${disk}" =~ ^[a-zA-Z0-9._-]+$ ]] || return 1
+  case "${disk}" in
+    *[0-9]) printf '/dev/%sp1\n' "${disk}" ;;
+    *) printf '/dev/%s1\n' "${disk}" ;;
+  esac
+}
+
+installer_verify_data_disk() {
+  local disk="/dev/${1#/dev/}" disk_type active_mounts
+  [[ -b "${disk}" ]] || { log "[ERROR] Selected disk not found: ${disk}"; return 1; }
+  disk_type=$(lsblk -dn -o TYPE "${disk}" 2>/dev/null | awk 'NF {print $1; exit}')
+  [[ "${disk_type}" == "disk" ]] || { log "[ERROR] Not a whole disk: ${disk}"; return 1; }
+  active_mounts=$(lsblk -nr -o MOUNTPOINT "${disk}" 2>/dev/null || true)
+  if printf '%s\n' "${active_mounts}" | grep -Eq '^(/$|/boot($|/)|\[SWAP\]$)'; then
+    log "[ERROR] Refusing to wipe OS or swap disk: ${disk}"
+    return 1
+  fi
+  return 0
+}
+
+# Reserve at least 4 GiB or 12% RAM and up to four host vCPUs.
+installer_vm_budget_check() {
+  local role="$1" vm_cpus="$2" vm_mem_gb="$3" peer_cpus="${4:-0}" peer_mem_gb="${5:-0}"
+  local v host_cpus host_mem_gb keep_cpus keep_mem_gb
+  for v in "${vm_cpus}" "${vm_mem_gb}" "${peer_cpus}" "${peer_mem_gb}"; do
+    [[ "${v}" =~ ^(0|[1-9][0-9]{0,5})$ ]] || { log "[ERROR] ${role}: invalid resource value '${v}'"; return 1; }
+  done
+  if (( vm_cpus < 1 || vm_mem_gb < 1 )); then
+    log "[ERROR] ${role}: vCPU and RAM allocations must be positive"
+    return 1
+  fi
+  host_cpus=$(getconf _NPROCESSORS_ONLN 2>/dev/null || nproc 2>/dev/null || echo 0)
+  host_mem_gb=$(awk '/^MemTotal:/ {print int($2 / 1048576); exit}' /proc/meminfo)
+  if [[ ! "${host_cpus}" =~ ^[1-9][0-9]*$ || ! "${host_mem_gb}" =~ ^[1-9][0-9]*$ ]]; then
+    log "[ERROR] ${role}: host resource discovery failed"
+    return 1
+  fi
+  keep_cpus=4
+  (( host_cpus < 8 )) && keep_cpus=2
+  (( host_cpus < 4 )) && keep_cpus=1
+  keep_mem_gb=$(( (host_mem_gb * 12 + 99) / 100 ))
+  (( keep_mem_gb < 4 )) && keep_mem_gb=4
+  if (( vm_cpus + peer_cpus > host_cpus - keep_cpus ||
+        vm_mem_gb + peer_mem_gb > host_mem_gb - keep_mem_gb )); then
+    log "[ERROR] ${role}: requested ${vm_cpus}+${peer_cpus} vCPU, ${vm_mem_gb}+${peer_mem_gb} GiB; host budget ${host_cpus}-${keep_cpus} vCPU, ${host_mem_gb}-${keep_mem_gb} GiB"
+    return 1
+  fi
+  log "[PREFLIGHT] ${role}: vCPU/RAM budget verified"
+  return 0
 }
 
 append_fstab_if_missing() {
@@ -2720,7 +2774,13 @@ step_02_hwe_kernel() {
   log "[STEP 02] Install HWE kernel"
   load_config
 
-  local pkg_name="linux-generic-hwe-24.04"
+  local ubuntu_version pkg_name
+  ubuntu_version=$(awk -F= '$1=="VERSION_ID" {gsub(/"/, "", $2); print $2; exit}' /etc/os-release 2>/dev/null)
+  case "${ubuntu_version}" in
+    20.04|22.04|24.04) pkg_name="linux-generic-hwe-${ubuntu_version}" ;;
+    26.04) pkg_name="linux-generic" ;;
+    *) log "[ERROR] Unsupported Ubuntu version: ${ubuntu_version:-unknown}"; return 1 ;;
+  esac
   local tmp_status="/tmp/xdr_step02_status.txt"
 
   #######################################
@@ -2734,9 +2794,9 @@ step_02_hwe_kernel() {
   hwe_installed="no"
   hwe_status_detail="not installed"
   
-  if dpkg -l 2>/dev/null | grep hwe | grep -q "linux-image-generic-hwe-24.04"; then
+  if dpkg-query -W -f='${Status}\n' "${pkg_name}" 2>/dev/null | grep -qx 'install ok installed'; then
     hwe_installed="yes"
-    hwe_status_detail="HWE kernel installed (linux-image-generic-hwe-24.04)"
+    hwe_status_detail="Kernel package installed (${pkg_name})"
   fi
 
   {
@@ -2843,9 +2903,9 @@ step_02_hwe_kernel() {
     hwe_now_detail="not installed"
     
     # Re-check HWE status: Check if linux-image-generic-hwe-24.04 is installed via dpkg -l | grep hwe
-    if dpkg -l 2>/dev/null | grep hwe | grep -q "linux-image-generic-hwe-24.04"; then
+    if dpkg-query -W -f='${Status}\n' "${pkg_name}" 2>/dev/null | grep -qx 'install ok installed'; then
       hwe_now="yes"
-      hwe_now_detail="HWE kernel installed (linux-image-generic-hwe-24.04)"
+      hwe_now_detail="Kernel package installed (${pkg_name})"
     fi
   fi
 
@@ -5167,8 +5227,8 @@ step_07_lvm_storage() {
 
   # Fallback to default on detection failure
   if [[ -z "${UBUNTU_VG}" ]]; then
-    log "[WARN] Could not detect OS VG name; using default (ubuntu-vg)."
-    UBUNTU_VG="ubuntu-vg"
+    log "[ERROR] Root filesystem is not on a detectable LVM VG; refusing to allocate DP volumes."
+    return 1
   else
     log "[STEP 07] Detected OS VG name: ${UBUNTU_VG}"
   fi
@@ -5183,6 +5243,15 @@ step_07_lvm_storage() {
     log "DATA_SSD_LIST empty; cannot proceed with STEP 07."
     return 1
   fi
+
+  # Revalidate saved disks before VM cleanup and destructive disk operations.
+  local selected_disk
+  for selected_disk in ${DATA_SSD_LIST}; do
+    if ! installer_verify_data_disk "${selected_disk}"; then
+      whiptail_msgbox "STEP 07 - Unsafe disk" "A selected disk is missing or contains the active OS or swap. Re-run STEP 01 and select safe data disks." 14 80
+      return 1
+    fi
+  done
 
   #######################################
   # If LVM/mounts seem present, ask to skip
@@ -5465,7 +5534,7 @@ step_07_lvm_storage() {
   # Wait for partition device nodes (e.g., /dev/sdb1) to appear
   for d in ${DATA_SSD_LIST}; do
     for _ in {1..10}; do
-      [[ -b "/dev/${d}1" ]] && break
+      [[ -b "$(installer_partition_one "${d}")" ]] && break
       sleep 0.3
     done
   done
@@ -5478,7 +5547,7 @@ step_07_lvm_storage() {
   local pv_list=""
   local stripe_count=0
   for d in ${DATA_SSD_LIST}; do
-    pv_list+=" /dev/${d}1"
+    pv_list+=" $(installer_partition_one "${d}")"
     ((stripe_count++))
   done
 
@@ -6858,8 +6927,12 @@ step_10_dl_master_deploy_v621() {
 
   local DL_CLUSTERSIZE="${DL_CLUSTERSIZE:-1}"
   local DL_VCPUS="${DL_VCPUS:-42}"
-  local DL_MEMORY_GB="${DL_MEMORY_GB:-186}"       # GB
+  local DL_MEMORY_GB="${DL_MEMORY_GB:-136}"       # GB
   local DL_DISK_GB="${DL_DISK_GB:-500}"           # GB
+  if ! installer_vm_budget_check "DL + DA" "${DL_VCPUS}" "${DL_MEMORY_GB}" "${DA_VCPUS:-46}" "${DA_MEMORY_GB:-80}"; then
+    whiptail_msgbox "STEP 10 - Insufficient host resources" "Combined DL and DA vCPU/RAM allocation exceeds available host capacity. Adjust VM settings before deployment." 14 80
+    return 1
+  fi
 
   local DL_INSTALL_DIR="${DL_INSTALL_DIR:-/stellar/dl}"
   local DL_BRIDGE="${DL_BRIDGE:-virbr0}"
@@ -7193,8 +7266,12 @@ step_11_da_master_deploy_v621() {
   log "[STEP 11] Selected VM name: ${DA_HOSTNAME}"
 
   local DA_VCPUS="${DA_VCPUS:-46}"
-  local DA_MEMORY_GB="${DA_MEMORY_GB:-156}"       # GB
+  local DA_MEMORY_GB="${DA_MEMORY_GB:-80}"       # GB
   local DA_DISK_GB="${DA_DISK_GB:-500}"           # GB
+  if ! installer_vm_budget_check "DL + DA" "${DA_VCPUS}" "${DA_MEMORY_GB}" "${DL_VCPUS:-42}" "${DL_MEMORY_GB:-136}"; then
+    whiptail_msgbox "STEP 11 - Insufficient host resources" "Combined DL and DA vCPU/RAM allocation exceeds available host capacity. Adjust VM settings before deployment." 14 80
+    return 1
+  fi
 
   local DA_INSTALL_DIR="${DA_INSTALL_DIR:-/stellar/da}"
   local DA_BRIDGE="${DA_BRIDGE:-virbr0}"
@@ -8279,7 +8356,7 @@ Do you want to continue?"
       local da_vcpus="${DA_VCPUS:-46}"
 
       # [Modified] Keep default value at 156
-      local da_mem_gb="${DA_MEMORY_GB:-156}"
+      local da_mem_gb="${DA_MEMORY_GB:-80}"
 
       log "[STEP 12] DA-master memory value to apply: ${da_mem_gb} GB"
 
@@ -9774,6 +9851,10 @@ step_10_dl_master_deploy() {
     local DL_VCPUS="${DL_VCPUS:-42}"
     local DL_MEMORY_GB="${DL_MEMORY_GB:-136}"       # in GB
     local DL_DISK_GB="${DL_DISK_GB:-500}"           # in GB
+  if ! installer_vm_budget_check "DL + DA" "${DL_VCPUS}" "${DL_MEMORY_GB}" "${DA_VCPUS:-46}" "${DA_MEMORY_GB:-80}"; then
+    whiptail_msgbox "STEP 10 - Insufficient host resources" "Combined DL and DA vCPU/RAM allocation exceeds available host capacity. Adjust VM settings before deployment." 14 80
+    return 1
+  fi
 
     local DL_INSTALL_DIR="${DL_INSTALL_DIR:-/stellar/dl}"
     local DL_BRIDGE="${DL_BRIDGE:-virbr0}"
@@ -10188,6 +10269,10 @@ step_11_da_master_deploy() {
     local DA_VCPUS="${DA_VCPUS:-46}"
     local DA_MEMORY_GB="${DA_MEMORY_GB:-80}"       # in GB
     local DA_DISK_GB="${DA_DISK_GB:-500}"          # in GB
+  if ! installer_vm_budget_check "DL + DA" "${DA_VCPUS}" "${DA_MEMORY_GB}" "${DL_VCPUS:-42}" "${DL_MEMORY_GB:-136}"; then
+    whiptail_msgbox "STEP 11 - Insufficient host resources" "Combined DL and DA vCPU/RAM allocation exceeds available host capacity. Adjust VM settings before deployment." 14 80
+    return 1
+  fi
 
     local DA_INSTALL_DIR="${DA_INSTALL_DIR:-/stellar/da}"
     local DA_BRIDGE="${DA_BRIDGE:-virbr0}"
