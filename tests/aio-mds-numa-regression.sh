@@ -68,6 +68,20 @@ if numa_expand_cpu_list '5-3' >/dev/null 2>&1; then echo 'inverted CPU range acc
 if numa_validate_guest_request aio 0 49 80; then echo 'too many AIO CPUs accepted' >&2; exit 1; fi
 if numa_validate_guest_request aio 0 48 109; then echo 'oversized AIO memory accepted' >&2; exit 1; fi
 
+# A successful but empty ONLINE result must not pin CPUs from sysfs.
+cp "${work}/topology.csv" "${work}/topology.good"
+grep -vE '^[0-9]+,1,Y$' "${work}/topology.good" > "${work}/topology.csv"
+if numa_node_cpu_list 1 >/dev/null 2>&1; then
+  echo 'offline NUMA1 CPUs accepted from sysfs' >&2; exit 1
+fi
+mv "${work}/topology.good" "${work}/topology.csv"
+
+# If lscpu fails completely, properly expand sysfs range lists.
+lscpu() { return 1; }
+assert_eq 'sysfs NUMA0 fallback' "$(numa_cpu_count "$(numa_node_cpu_list 0)")" 48
+assert_eq 'sysfs NUMA1 fallback' "$(numa_cpu_count "$(numa_node_cpu_list 1)")" 48
+lscpu() { cat "${work}/topology.csv"; }
+
 DRY_RUN=0
 numa_apply_vm_policy aio 0
 numa_apply_vm_policy mds 1
