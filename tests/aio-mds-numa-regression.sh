@@ -62,6 +62,31 @@ assert_eq 'NUMA node count' "$(numa_node_count)" 2
 assert_eq 'NUMA0 CPUs' "$(numa_cpu_count "$(numa_node_cpu_list 0)")" 48
 assert_eq 'NUMA1 CPUs' "$(numa_cpu_count "$(numa_node_cpu_list 1)")" 48
 assert_eq 'MDS default CPU count' "$(numa_cpu_count "$(numa_take_cpus "$(numa_node_cpu_list 1)" 44)")" 44
+# A saved legacy '1' MUST NOT replace the current NUMA-derived prompt default.
+AIO_VCPUS=1
+SENSOR_VCPUS=1
+assert_eq 'AIO NUMA0 all 48 default' "$(numa_default_vm_vcpus "$(numa_node_cpu_list 0)" 0)" 48
+assert_eq 'MDS NUMA1 48 minus 4 default' "$(numa_default_vm_vcpus "$(numa_node_cpu_list 1)" 4)" 44
+assert_eq 'MDS NUMA1 24 minus 4 default' "$(numa_default_vm_vcpus "$(numa_expand_cpu_list '24-47')" 4)" 20
+assert_eq 'MDS NUMA1 8 minus 4 default' "$(numa_default_vm_vcpus '0,1,2,3,4,5,6,7' 4)" 4
+if numa_default_vm_vcpus '0,1,2,3' 4 >/dev/null 2>&1; then
+  echo 'MDS default illegally leaves zero CPUs after host reserve' >&2
+  exit 1
+fi
+assert_eq 'NUMA0 manual vCPU request' "$(numa_take_cpus "$(numa_node_cpu_list 0)" 8 | awk -F, '{print NF}')" 8
+assert_eq 'NUMA1 manual vCPU request' "$(numa_take_cpus "$(numa_node_cpu_list 1)" 12 | awk -F, '{print NF}')" 12
+numa_validate_guest_request aio 0 8 80
+numa_validate_guest_request mds 1 12 80
+
+# Verify actual Whiptail prompt arguments, not only helper arithmetic.
+# Both fields start from current NUMA topology even if saved config was 1.
+grep -Fq 'whiptail_inputbox "STEP 09 - AIO vCPU" "${aio_vcpu_msg}" "${default_aio_vcpus}"' "${installer}"
+grep -Fq 'whiptail_inputbox "STEP 11 - Sensor (MDS) vCPU" "${vcpu_default_msg}" "${default_sensor_vcpus}"' "${installer}"
+grep -Fq 'default_aio_vcpus=$(numa_default_vm_vcpus "${node0_cpus}" 0)' "${installer}"
+grep -Fq 'default_sensor_vcpus=$(numa_default_vm_vcpus "${node1_cpus}" 4)' "${installer}"
+grep -Fq 'AIO_VCPUS="${_AIO_VCPU_INPUT}"' "${installer}"
+grep -Fq 'sensor_vcpus="${_SENSOR_VCPU_INPUT}"' "${installer}"
+
 assert_eq 'node0 RAM safe cap' "$(numa_node_memory_limit_gib 0)" 108
 assert_eq 'node1 RAM safe cap' "$(numa_node_memory_limit_gib 1)" 108
 if numa_expand_cpu_list '5-3' >/dev/null 2>&1; then echo 'inverted CPU range accepted' >&2; exit 1; fi
