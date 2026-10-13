@@ -7256,25 +7256,33 @@ step_09_aio_deploy() {
     available_mem_gb=$((total_mem_gb - host_reserve_gb))
     [[ ${available_mem_gb} -le 0 ]] && available_mem_gb=16
     
-    # Check NUMA configuration for AIO vCPU default calculation
-    # AIO default: All NUMA0 vCPUs
+    # NUMA topology: count online logical CPU IDs, never comma-delimited ranges.
     local numa_nodes=1
     local node0_cpus="" node0_count=0
-    if command -v lscpu >/dev/null 2>&1; then
-      numa_nodes=$(lscpu | grep "^NUMA node(s):" | awk '{print $3}')
-      if [[ "${numa_nodes}" -ge 2 ]]; then
-        # Extract NUMA node0 CPU list
-        node0_cpus=$(lscpu | grep "NUMA node0 CPU(s):" | sed 's/NUMA node0 CPU(s)://' | tr -d '[:space:]')
-        # Count CPUs in NUMA node0
-        if [[ -n "${node0_cpus}" ]]; then
-          node0_count=$(echo "${node0_cpus}" | tr ',' '\n' | wc -l)
-        fi
-      fi
+    numa_nodes=$(numa_node_count)
+    if (( numa_nodes >= 2 )); then
+      node0_cpus=$(numa_node_cpu_list 0) || {
+        log "[ERROR] NUMA0 online CPU topology unavailable; AIO deployment blocked."
+        return 1
+      }
+      node0_count=$(numa_cpu_count "${node0_cpus}") || return 1
+      log "[STEP 09] NUMA0 online CPU count=${node0_count}; CPUs=${node0_cpus}"
     fi
     
     # Default memory: 70% of available memory (after 12% host reserve) for AIO
     local default_aio_mem_gb=$((available_mem_gb * 70 / 100))
     [[ ${default_aio_mem_gb} -lt 8 ]] && default_aio_mem_gb=8
+    if (( numa_nodes >= 2 )); then
+      local numa0_mem_limit_gb
+      numa0_mem_limit_gb=$(numa_node_memory_limit_gib 0) || {
+        log "[ERROR] NUMA0 RAM capacity unavailable; cannot safely bind AIO memory."
+        return 1
+      }
+      if (( default_aio_mem_gb > numa0_mem_limit_gb )); then
+        log "[STEP 09] AIO default memory capped from ${default_aio_mem_gb}GiB to NUMA0 safe limit ${numa0_mem_limit_gb}GiB."
+        default_aio_mem_gb="${numa0_mem_limit_gb}"
+      fi
+    fi
     
     # Default vCPU: All NUMA0 CPUs (if NUMA0 detected)
     # This ensures AIO gets all CPUs from NUMA0
@@ -7331,6 +7339,15 @@ step_09_aio_deploy() {
     else
         # User canceled or empty input - use default
         AIO_VCPUS="${default_aio_vcpus}"
+    fi
+
+    # Validate before VM deployment: every requested vCPU and all guest RAM
+    # must fit on NUMA0 if strict NUMA placement is requested.
+    if (( numa_nodes >= 2 )); then
+      if ! numa_validate_guest_request "aio" 0 "${AIO_VCPUS}" "${AIO_MEMORY_GB}"; then
+        whiptail_msgbox "STEP 09 - NUMA0 capacity exceeded" "The selected AIO vCPU/memory does not fit NUMA0.\nReview the NUMA0 CPU count and memory limit above; no VM deployment has started." 15 80
+        return 1
+      fi
     fi
 
     # 3) Disk size
@@ -8344,25 +8361,33 @@ step_11_sensor_deploy() {
   available_mem_gb=$((total_mem_gb - host_reserve_gb))
   [[ ${available_mem_gb} -le 0 ]] && available_mem_gb=16
   
-  # Check NUMA configuration for Sensor vCPU default calculation
-  # Sensor default: NUMA1 vCPUs minus 4 (4 CPUs reserved for host)
+  # Sensor defaults to NUMA1 with 4 online host CPUs reserved on that node.
   local numa_nodes=1
   local node1_cpus="" node1_count=0
-  if command -v lscpu >/dev/null 2>&1; then
-    numa_nodes=$(lscpu | grep "^NUMA node(s):" | awk '{print $3}')
-    if [[ "${numa_nodes}" -ge 2 ]]; then
-      # Extract NUMA node1 CPU list
-      node1_cpus=$(lscpu | grep "NUMA node1 CPU(s):" | sed 's/NUMA node1 CPU(s)://' | tr -d '[:space:]')
-      # Count CPUs in NUMA node1
-      if [[ -n "${node1_cpus}" ]]; then
-        node1_count=$(echo "${node1_cpus}" | tr ',' '\n' | wc -l)
-      fi
-    fi
+  numa_nodes=$(numa_node_count)
+  if (( numa_nodes >= 2 )); then
+    node1_cpus=$(numa_node_cpu_list 1) || {
+      log "[ERROR] NUMA1 online CPU topology unavailable; Sensor deployment blocked."
+      return 1
+    }
+    node1_count=$(numa_cpu_count "${node1_cpus}") || return 1
+    log "[STEP 11] NUMA1 online CPU count=${node1_count}; CPUs=${node1_cpus}"
   fi
   
   # Default memory: 30% of available memory (after 12% host reserve) for Sensor
   local default_sensor_mem_gb=$((available_mem_gb * 30 / 100))
   [[ ${default_sensor_mem_gb} -lt 8 ]] && default_sensor_mem_gb=8
+  if (( numa_nodes >= 2 )); then
+    local numa1_mem_limit_gb
+    numa1_mem_limit_gb=$(numa_node_memory_limit_gib 1) || {
+      log "[ERROR] NUMA1 RAM capacity unavailable; cannot safely bind Sensor memory."
+      return 1
+    }
+    if (( default_sensor_mem_gb > numa1_mem_limit_gb )); then
+      log "[STEP 11] MDS default memory capped from ${default_sensor_mem_gb}GiB to NUMA1 safe limit ${numa1_mem_limit_gb}GiB."
+      default_sensor_mem_gb="${numa1_mem_limit_gb}"
+    fi
+  fi
   
   # Default vCPU: NUMA1 CPUs minus 4 (4 CPUs reserved for host)
   # This ensures Sensor gets NUMA1 CPUs except 4 reserved for host
@@ -8466,6 +8491,14 @@ step_11_sensor_deploy() {
     sensor_vcpus="${default_sensor_vcpus}"
   fi
 
+  # Reject over-allocation before touching any existing Sensor VM.
+  if (( numa_nodes >= 2 )); then
+    if ! numa_validate_guest_request "mds" 1 "${sensor_vcpus}" "${sensor_mem_gb}"; then
+      whiptail_msgbox "STEP 11 - NUMA1 capacity exceeded" "The selected Sensor vCPU/memory does not fit NUMA1.\nReview the NUMA1 CPU count and memory limit above; no Sensor VM deployment has started." 15 80
+      return 1
+    fi
+  fi
+
   # 3) Disk size
   local _SENSOR_DISK_INPUT
   local disk_input_rc
@@ -8544,25 +8577,17 @@ step_11_sensor_deploy() {
     log "[STEP 11] Sensor image preflight passed: format=qcow2, virtual_size=${image_virtual_gib}GB, requested_disk=${disksize}GB, LV=${sensor_lv_gib}GB"
   fi
 
-  # NUMA Aware CPUSET Calculation Logic for mds (NUMA1)
-  local numa_nodes=1
-  local node1_cpus=""
-  if command -v lscpu >/dev/null 2>&1; then
-    numa_nodes=$(lscpu | grep "^NUMA node(s):" | awk '{print $3}')
-    if [[ "${numa_nodes}" -ge 2 ]]; then
-      # Extract NUMA node1 CPU list
-      node1_cpus=$(lscpu | grep "NUMA node1 CPU(s):" | sed 's/NUMA node1 CPU(s)://' | tr -d '[:space:]')
-    fi
-  fi
-
+  # Store the exact online pCPU IDs reserved for Sensor on NUMA1; do not
+  # truncate a Linux range string such as 24-47,72-95 by comma.
   local sensor_cpuset_mds
-  if [[ "${numa_nodes}" -ge 2 && -n "${node1_cpus}" ]]; then
-    log "[STEP 11] NUMA node(${numa_nodes}) Detected. Setting CPU Pinning for mds on NUMA1."
-    # Cut the list according to the number of vCPUs entered by the user (allocate from the front)
-    sensor_cpuset_mds=$(echo "${node1_cpus}" | cut -d',' -f1-"${sensor_vcpus}")
-    log "  -> MDS (Node1): ${sensor_cpuset_mds}"
+  if (( numa_nodes >= 2 )); then
+    sensor_cpuset_mds=$(numa_take_cpus "${node1_cpus}" "${sensor_vcpus}") || {
+      log "[ERROR] Requested MDS CPU count exceeds NUMA1 online CPU list."
+      return 1
+    }
+    log "[STEP 11] MDS NUMA1 CPU selection: ${sensor_cpuset_mds}"
   else
-    log "[STEP 11] NUMA detection failed. Using sequential allocation."
+    log "[STEP 11] Single NUMA node; retaining legacy sequential CPU allocation."
     sensor_cpuset_mds="0-$((sensor_vcpus-1))"
   fi
 
