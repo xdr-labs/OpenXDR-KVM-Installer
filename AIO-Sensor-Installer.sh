@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #
 # XDR AIO & Sensor Installer Framework (SSH + Whiptail based TUI)
-# OpenXDR-installer.sh based on AIO + Sensor deployment scenario
+# AIO and modular Sensor deployment on a shared KVM host
 #
 
 set -euo pipefail
@@ -459,6 +459,37 @@ run_cmd_linkscan() {
 }
 
 
+installer_vm_budget_check() {
+  local role="$1" vm_cpus="$2" vm_mem_gb="$3" peer_cpus="${4:-0}" peer_mem_gb="${5:-0}"
+  local v host_cpus host_mem_gb keep_cpus keep_mem_gb
+  for v in "${vm_cpus}" "${vm_mem_gb}" "${peer_cpus}" "${peer_mem_gb}"; do
+    [[ "${v}" =~ ^(0|[1-9][0-9]{0,5})$ ]] || { log "[ERROR] ${role}: invalid resource value '${v}'"; return 1; }
+  done
+  if (( vm_cpus < 1 || vm_mem_gb < 1 )); then
+    log "[ERROR] ${role}: vCPU and RAM allocations must be positive"
+    return 1
+  fi
+  host_cpus=$(getconf _NPROCESSORS_ONLN 2>/dev/null || nproc 2>/dev/null || echo 0)
+  host_mem_gb=$(awk '/^MemTotal:/ {print int($2 / 1048576); exit}' /proc/meminfo)
+  if [[ ! "${host_cpus}" =~ ^[1-9][0-9]*$ || ! "${host_mem_gb}" =~ ^[1-9][0-9]*$ ]]; then
+    log "[ERROR] ${role}: host resource discovery failed"
+    return 1
+  fi
+  keep_cpus=4
+  (( host_cpus < 8 )) && keep_cpus=2
+  (( host_cpus < 4 )) && keep_cpus=1
+  keep_mem_gb=$(( (host_mem_gb * 12 + 99) / 100 ))
+  (( keep_mem_gb < 4 )) && keep_mem_gb=4
+  if (( vm_cpus + peer_cpus > host_cpus - keep_cpus ||
+        vm_mem_gb + peer_mem_gb > host_mem_gb - keep_mem_gb )); then
+    log "[ERROR] ${role}: requested ${vm_cpus}+${peer_cpus} vCPU, ${vm_mem_gb}+${peer_mem_gb} GiB; host budget ${host_cpus}-${keep_cpus} vCPU, ${host_mem_gb}-${keep_mem_gb} GiB"
+    return 1
+  fi
+  log "[PREFLIGHT] ${role}: vCPU/RAM budget verified"
+  return 0
+}
+
+
 # Download a file with HTTP error detection and atomic replacement.
 # Arguments: URL destination username password label
 download_acps_file_atomic() {
@@ -896,6 +927,10 @@ ensure_ubuntu_vg_free_space() {
   vg_free_mib=$(sudo vgs --noheadings --units m --nosuffix -o vg_free "${ubuntu_vg}" 2>/dev/null \
     | lvm_floor_units)
   [[ -z "${vg_free_mib}" ]] && vg_free_mib=0
+  if [[ "${DRY_RUN:-1}" -eq 1 ]]; then
+    log "[DRY-RUN] VG expansion simulated; no partition, PV, or VG was created."
+    return 0
+  fi
   if [[ "${vg_free_mib}" -lt "${required_lv_mib}" ]]; then
     log "[ERROR] ${ubuntu_vg} free space is still insufficient after vgextend (${vg_free_mib}MiB < ${required_lv_mib}MiB)."
     return 1
@@ -6087,27 +6122,6 @@ step_07_lvm_storage() {
   local AIO_INSTALL_DIR="${AIO_INSTALL_DIR:-/stellar/aio}"
   local AIO_IMAGE_DIR="${AIO_INSTALL_DIR}/images"
 
-  # If an existing AIO VM is present, require explicit typed confirmation before removal.
-  if virsh dominfo "${AIO_HOSTNAME}" >/dev/null 2>&1; then
-    if ! confirm_destroy_vm "${AIO_HOSTNAME}" "STEP 07 - LVM Storage"; then
-      log "[STEP 07] Existing ${AIO_HOSTNAME} VM was kept; LVM reconfiguration canceled."
-      return 0
-    fi
-
-    log "[STEP 07] Exact confirmation received. Destroying and undefining ${AIO_HOSTNAME} before LVM configuration."
-    if [[ "${_DRY_RUN}" -eq 1 ]]; then
-      echo "[DRY_RUN] virsh destroy ${AIO_HOSTNAME} || true"
-      echo "[DRY_RUN] virsh undefine ${AIO_HOSTNAME} --nvram || virsh undefine ${AIO_HOSTNAME} || true"
-      echo "[DRY_RUN] rm -rf '${AIO_IMAGE_DIR}/${AIO_HOSTNAME}' || true"
-    else
-      virsh destroy "${AIO_HOSTNAME}" >/dev/null 2>&1 || true
-      virsh undefine "${AIO_HOSTNAME}" --nvram >/dev/null 2>&1 || virsh undefine "${AIO_HOSTNAME}" >/dev/null 2>&1 || true
-      if [ -d "${AIO_IMAGE_DIR}/${AIO_HOSTNAME}" ]; then
-        sudo rm -rf "${AIO_IMAGE_DIR:?}/${AIO_HOSTNAME}" 2>/dev/null || true
-      fi
-    fi
-  fi
-
   # Auto-detect OS VG name
   local root_dev
   root_dev=$(findmnt -n -o SOURCE /)
@@ -6118,8 +6132,8 @@ step_07_lvm_storage() {
 
   # Fallback to default on detection failure
   if [[ -z "${UBUNTU_VG}" ]]; then
-    log "[WARN] Could not detect OS VG name; using default (ubuntu-vg)."
-    UBUNTU_VG="ubuntu-vg"
+    log "[ERROR] Root filesystem is not on an identifiable LVM VG; refusing to guess a storage target."
+    return 1
   else
     log "[STEP 07] Detected OS VG name: ${UBUNTU_VG}"
   fi
@@ -6287,6 +6301,27 @@ step_07_lvm_storage() {
   fi
 
   #######################################
+  # If an existing AIO VM is present, require explicit typed confirmation before removal.
+  if virsh dominfo "${AIO_HOSTNAME}" >/dev/null 2>&1; then
+    if ! confirm_destroy_vm "${AIO_HOSTNAME}" "STEP 07 - LVM Storage"; then
+      log "[STEP 07] Existing ${AIO_HOSTNAME} VM was kept; LVM reconfiguration canceled."
+      return 0
+    fi
+
+    log "[STEP 07] Exact confirmation received. Destroying and undefining ${AIO_HOSTNAME} before LVM configuration."
+    if [[ "${_DRY_RUN}" -eq 1 ]]; then
+      echo "[DRY_RUN] virsh destroy ${AIO_HOSTNAME} || true"
+      echo "[DRY_RUN] virsh undefine ${AIO_HOSTNAME} --nvram || virsh undefine ${AIO_HOSTNAME} || true"
+      echo "[DRY_RUN] rm -rf '${AIO_IMAGE_DIR}/${AIO_HOSTNAME}' || true"
+    else
+      virsh destroy "${AIO_HOSTNAME}" >/dev/null 2>&1 || true
+      virsh undefine "${AIO_HOSTNAME}" --nvram >/dev/null 2>&1 || virsh undefine "${AIO_HOSTNAME}" >/dev/null 2>&1 || true
+      if [ -d "${AIO_IMAGE_DIR}/${AIO_HOSTNAME}" ]; then
+        sudo rm -rf "${AIO_IMAGE_DIR:?}/${AIO_HOSTNAME}" 2>/dev/null || true
+      fi
+    fi
+  fi
+
   # 0-5) Remove all existing LVM/VG/LV on selected disks
   #######################################
   log "[STEP 07] Removing existing LVM metadata (LV/VG/PV) from selected disks."
@@ -7370,6 +7405,11 @@ step_09_aio_deploy() {
         save_config
     fi
 
+    if ! installer_vm_budget_check "AIO + Sensor" "${AIO_VCPUS}" "${AIO_MEMORY_GB}"; then
+      whiptail_msgbox "STEP 09 - Insufficient host resources" "Requested AIO vCPU/RAM allocation exceeds available KVM host capacity." 14 80
+      return 1
+    fi
+
     # Convert memory to MB
     local AIO_MEMORY_MB=$(( AIO_MEMORY_GB * 1024 ))
 
@@ -7575,8 +7615,8 @@ step_10_sensor_lv_download() {
   local UBUNTU_VG
   UBUNTU_VG=$(sudo lvs --noheadings -o vg_name "${root_dev}" 2>/dev/null | awk '{print $1}')
   if [[ -z "${UBUNTU_VG}" ]]; then
-    UBUNTU_VG="${LV_LOCATION:-ubuntu-vg}"
-    log "[WARN] Could not detect OS VG from root device; fallback to ${UBUNTU_VG}"
+    log "[ERROR] Sensor LV target cannot be inferred from the root filesystem; no VG change was made."
+    return 1
   else
     log "[STEP 10] Detected OS VG: ${UBUNTU_VG} (root=${root_dev})"
     LV_LOCATION="${UBUNTU_VG}"
@@ -8556,6 +8596,11 @@ step_11_sensor_deploy() {
 
   if (( capacity_limited_sensor_disk == 1 )) && (( sensor_disk_gb > default_sensor_disk_gb )); then
     whiptail_msgbox "STEP 11 - Insufficient Sensor LV" "Sensor VM disk ${sensor_disk_gb}GiB would exceed the safe ${default_sensor_disk_gb}GiB capacity of the ${sensor_host_lv_gb}GiB Sensor LV.\nKeep at least 30GiB of host filesystem headroom." 15 85
+    return 1
+  fi
+
+  if ! installer_vm_budget_check "AIO + Sensor" "${sensor_vcpus}" "${sensor_mem_gb}" "${AIO_VCPUS:-0}" "${AIO_MEMORY_GB:-0}"; then
+    whiptail_msgbox "STEP 11 - Insufficient host resources" "Combined AIO and Sensor vCPU/RAM allocation exceeds host capacity. Adjust either VM before deployment." 14 80
     return 1
   fi
 
