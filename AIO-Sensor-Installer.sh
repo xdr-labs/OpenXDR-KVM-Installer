@@ -7213,35 +7213,6 @@ step_09_aio_deploy() {
         fi
     fi
 
-    # If aio already exists, require exact typed confirmation before destroy/cleanup.
-    if virsh dominfo "${AIO_HOSTNAME}" >/dev/null 2>&1; then
-        if ! confirm_destroy_vm "${AIO_HOSTNAME}" "STEP 09 - AIO VM Deployment"; then
-            log "[STEP 09] Existing ${AIO_HOSTNAME} VM was kept; redeployment canceled."
-            return 0
-        fi
-
-        echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 09] Exact confirmation received. Destroying and undefining ${AIO_HOSTNAME}..."
-
-        local AIO_VM_DIR="${AIO_IMAGE_DIR}/${AIO_HOSTNAME}"
-
-        if [ "${_DRY_RUN}" -eq 1 ]; then
-            echo "[DRY_RUN] virsh destroy ${AIO_HOSTNAME} || true"
-            echo "[DRY_RUN] virsh undefine ${AIO_HOSTNAME} --nvram || virsh undefine ${AIO_HOSTNAME} || true"
-            echo "[DRY_RUN] rm -f '${AIO_VM_DIR}/${AIO_HOSTNAME}.raw' || true"
-            echo "[DRY_RUN] rm -f '${AIO_VM_DIR}/${AIO_HOSTNAME}.log' || true"
-        else
-            virsh destroy "${AIO_HOSTNAME}" >/dev/null 2>&1 || true
-            virsh undefine "${AIO_HOSTNAME}" --nvram >/dev/null 2>&1 || virsh undefine "${AIO_HOSTNAME}" >/dev/null 2>&1 || true
-
-            if [ -d "${AIO_VM_DIR}" ]; then
-                echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 09] Removing old AIO image files in ${AIO_VM_DIR}."
-                sudo rm -rf "${AIO_VM_DIR}"/* 2>/dev/null || true
-                sudo rmdir "${AIO_VM_DIR}" 2>/dev/null || true
-                log "[STEP 09] Old AIO image directory ${AIO_VM_DIR} cleaned up"
-            fi
-        fi
-    fi
-
     ############################################################
     # Prompt for AIO VM configuration (memory, vCPU, disk)
     ############################################################
@@ -7435,6 +7406,36 @@ Run virt_deploy_uvp_centos.sh with these settings?"
             mark_step_done "${STEP_ID}"
         fi
         return 0
+    fi
+
+    # Redeploy existing AIO only AFTER validating CPU/memory and showing the
+    # final execution confirmation. Keep the existing typed deletion safeguard.
+    if virsh dominfo "${AIO_HOSTNAME}" >/dev/null 2>&1; then
+        if ! confirm_destroy_vm "${AIO_HOSTNAME}" "STEP 09 - AIO VM Deployment"; then
+            log "[STEP 09] Existing ${AIO_HOSTNAME} VM was kept; redeployment canceled."
+            return 0
+        fi
+
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 09] Exact confirmation received. Destroying and undefining ${AIO_HOSTNAME}..."
+
+        local AIO_VM_DIR="${AIO_IMAGE_DIR}/${AIO_HOSTNAME}"
+
+        if [ "${_DRY_RUN}" -eq 1 ]; then
+            echo "[DRY_RUN] virsh destroy ${AIO_HOSTNAME} || true"
+            echo "[DRY_RUN] virsh undefine ${AIO_HOSTNAME} --nvram || virsh undefine ${AIO_HOSTNAME} || true"
+            echo "[DRY_RUN] rm -f '${AIO_VM_DIR}/${AIO_HOSTNAME}.raw' || true"
+            echo "[DRY_RUN] rm -f '${AIO_VM_DIR}/${AIO_HOSTNAME}.log' || true"
+        else
+            virsh destroy "${AIO_HOSTNAME}" >/dev/null 2>&1 || true
+            virsh undefine "${AIO_HOSTNAME}" --nvram >/dev/null 2>&1 || virsh undefine "${AIO_HOSTNAME}" >/dev/null 2>&1 || true
+
+            if [ -d "${AIO_VM_DIR}" ]; then
+                echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 09] Removing old AIO image files in ${AIO_VM_DIR}."
+                sudo rm -rf "${AIO_VM_DIR}"/* 2>/dev/null || true
+                sudo rmdir "${AIO_VM_DIR}" 2>/dev/null || true
+                log "[STEP 09] Old AIO image directory ${AIO_VM_DIR} cleaned up"
+            fi
+        fi
     fi
 
     # Actual execution
