@@ -636,6 +636,15 @@ numa_cpu_count() {
   awk -F, '{print NF}' <<< "${csv}"
 }
 
+# Calculate the initial interactive VM vCPU default from the current online
+# NUMA node CPU list. The reserved CPUs belong to the host, not the guest.
+numa_default_vm_vcpus() {
+  local cpu_list="${1:-}" host_reserve="${2:-}" online_count=""
+  [[ "${host_reserve}" =~ ^[0-9]+$ ]] || return 1
+  online_count=$(numa_cpu_count "${cpu_list}") || return 1
+  (( online_count > host_reserve )) || return 1
+  printf '%s\n' "$((online_count - host_reserve))"
+}
 numa_take_cpus() {
   local csv="${1:-}" requested="${2:-}" i result=""
   [[ "${csv}" =~ ^[0-9]+(,[0-9]+)*$ && "${requested}" =~ ^[1-9][0-9]*$ ]] || return 1
@@ -7271,7 +7280,10 @@ step_09_aio_deploy() {
     local default_aio_vcpus
     if [[ "${numa_nodes}" -ge 2 && ${node0_count} -gt 0 ]]; then
       # Allocate all NUMA0 CPUs to AIO
-      default_aio_vcpus=${node0_count}
+      default_aio_vcpus=$(numa_default_vm_vcpus "${node0_cpus}" 0) || {
+        log "[ERROR] Cannot calculate AIO NUMA0 vCPU default from online CPUs."
+        return 1
+      }
     else
       # NUMA detection failed: Use half of total CPUs as fallback
       default_aio_vcpus=$((total_cpus / 2))
@@ -7282,6 +7294,8 @@ step_09_aio_deploy() {
     
     # Use existing values if set, otherwise use calculated defaults
     : "${AIO_MEMORY_GB:=${default_aio_mem_gb}}"
+    # Preserve saved config for compatibility, but never use stale AIO_VCPUS
+    # as the default text prefilled in the vCPU input dialog.
     : "${AIO_VCPUS:=${default_aio_vcpus}}"
     : "${AIO_DISK_GB:=${default_aio_disk_gb}}"
     
@@ -7305,18 +7319,19 @@ step_09_aio_deploy() {
     # 2) vCPU
     local aio_vcpu_msg
     if [[ "${numa_nodes}" -ge 2 && ${node0_count} -gt 0 ]]; then
-      aio_vcpu_msg="Enter number of vCPUs for AIO VM.\n\nTotal logical CPUs: ${total_cpus}\nNUMA0 CPUs: ${node0_count}\nDefault value: ${default_aio_vcpus} (all NUMA0 CPUs)\nExample: Enter 46"
+      aio_vcpu_msg="Enter number of vCPUs for AIO VM.\n\nTotal logical CPUs: ${total_cpus}\nNUMA0 CPUs: ${node0_count}\nDefault value: ${default_aio_vcpus} (all NUMA0 online logical CPUs)\nPress Enter for automatic value or enter a different vCPU count.\nExample: Enter ${default_aio_vcpus}"
     else
-      aio_vcpu_msg="Enter number of vCPUs for AIO VM.\n\nTotal logical CPUs: ${total_cpus}\nDefault value: ${default_aio_vcpus} (half of total CPUs)\nExample: Enter 46"
+      aio_vcpu_msg="Enter number of vCPUs for AIO VM.\n\nTotal logical CPUs: ${total_cpus}\nDefault value: ${default_aio_vcpus} (single-NUMA fallback)\nPress Enter for automatic value or enter a different vCPU count.\nExample: Enter ${default_aio_vcpus}"
     fi
     local _AIO_VCPU_INPUT
-    _AIO_VCPU_INPUT="$(whiptail_inputbox "STEP 09 - AIO vCPU" "${aio_vcpu_msg}" "${AIO_VCPUS}" 12 70)"
+    _AIO_VCPU_INPUT="$(whiptail_inputbox "STEP 09 - AIO vCPU" "${aio_vcpu_msg}" "${default_aio_vcpus}" 12 70)"
 
     if [ $? -eq 0 ] && [ -n "${_AIO_VCPU_INPUT}" ]; then
         if [[ "${_AIO_VCPU_INPUT}" =~ ^[0-9]+$ ]] && [ "${_AIO_VCPU_INPUT}" -gt 0 ]; then
             AIO_VCPUS="${_AIO_VCPU_INPUT}"
         else
-            whiptail_msgbox "STEP 09 - AIO vCPU" "Invalid vCPU value.\nUsing current default (${AIO_VCPUS})." 10 70
+            whiptail_msgbox "STEP 09 - AIO vCPU" "Invalid vCPU value.\nUsing automatic default (${default_aio_vcpus})." 10 70
+            AIO_VCPUS="${default_aio_vcpus}"
         fi
     else
         # User canceled or empty input - use default
@@ -8401,8 +8416,11 @@ step_11_sensor_deploy() {
   local default_sensor_vcpus
   if [[ "${numa_nodes}" -ge 2 && ${node1_count} -gt 0 ]]; then
     # Allocate NUMA1 CPUs minus 4 (4 CPUs reserved for host)
-    default_sensor_vcpus=$((node1_count - 4))
-    [[ ${default_sensor_vcpus} -lt 2 ]] && default_sensor_vcpus=2
+    default_sensor_vcpus=$(numa_default_vm_vcpus "${node1_cpus}" 4) || {
+      log "[ERROR] NUMA1 has ${node1_count} online CPU(s); cannot reserve 4 for the host and allocate MDS vCPUs."
+      whiptail_msgbox "STEP 11 - NUMA1 CPU Capacity" "MDS requires at least 5 online NUMA1 CPUs to reserve 4 for the host.\nNUMA1 online CPUs: ${node1_count}" 12 80
+      return 1
+    }
   else
     # NUMA detection failed: Total CPUs minus 4 as fallback
     default_sensor_vcpus=$((total_cpus - 4))
@@ -8470,13 +8488,13 @@ step_11_sensor_deploy() {
   # 2) vCPU
   local vcpu_default_msg
   if [[ "${numa_nodes}" -ge 2 && ${node1_count} -gt 0 ]]; then
-    vcpu_default_msg="Enter number of vCPUs for Sensor VM (mds).\n\nTotal logical CPUs: ${total_cpus}\nNUMA1 CPUs: ${node1_count}\nDefault value: ${default_sensor_vcpus} (NUMA1 CPUs - 4)\nExample: Enter 22"
+    vcpu_default_msg="Enter number of vCPUs for Sensor VM (mds).\n\nTotal logical CPUs: ${total_cpus}\nNUMA1 CPUs: ${node1_count}\nDefault value: ${default_sensor_vcpus} (NUMA1 online CPUs - 4 for host)\nPress Enter for automatic value or enter a different vCPU count.\nExample: Enter ${default_sensor_vcpus}"
   else
-    vcpu_default_msg="Enter number of vCPUs for Sensor VM (mds).\n\nTotal logical CPUs: ${total_cpus}\nDefault value: ${default_sensor_vcpus} (total CPUs - 4)\nExample: Enter 22"
+    vcpu_default_msg="Enter number of vCPUs for Sensor VM (mds).\n\nTotal logical CPUs: ${total_cpus}\nDefault value: ${default_sensor_vcpus} (single-NUMA fallback)\nPress Enter for automatic value or enter a different vCPU count.\nExample: Enter ${default_sensor_vcpus}"
   fi
   local _SENSOR_VCPU_INPUT
   local vcpu_input_rc
-  _SENSOR_VCPU_INPUT="$(whiptail_inputbox "STEP 11 - Sensor (MDS) vCPU" "${vcpu_default_msg}" "${SENSOR_VCPUS:-${default_sensor_vcpus}}" 12 70)"
+  _SENSOR_VCPU_INPUT="$(whiptail_inputbox "STEP 11 - Sensor (MDS) vCPU" "${vcpu_default_msg}" "${default_sensor_vcpus}" 12 70)"
   vcpu_input_rc=$?
 
   local sensor_vcpus
