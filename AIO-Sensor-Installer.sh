@@ -7288,7 +7288,7 @@ step_09_aio_deploy() {
     # 1) Memory
     # Always use calculated default value for input box (not saved value)
     local _AIO_MEM_INPUT
-    _AIO_MEM_INPUT="$(whiptail_inputbox "STEP 09 - AIO memory" "Enter memory (GB) for AIO VM.\n\nTotal memory: ${total_mem_gb}GB\nHost reserve (12%): ${host_reserve_gb}GB\nAvailable: ${available_mem_gb}GB\nDefault value: ${default_aio_mem_gb}GB (70% of available)\nExample: Enter 136" "${default_aio_mem_gb}" 14 80)"
+    _AIO_MEM_INPUT="$(whiptail_inputbox "STEP 09 - AIO memory" "Enter memory (GB) for AIO VM.\n\nTotal memory: ${total_mem_gb}GB\nHost reserve (12%): ${host_reserve_gb}GB\nAvailable: ${available_mem_gb}GB\nDefault value: ${default_aio_mem_gb}GB (70% baseline, capped by NUMA0 when applicable)\nNUMA0 safe limit: ${numa0_mem_limit_gb:-N/A}GB\nExample: Enter ${default_aio_mem_gb}" "${default_aio_mem_gb}" 14 80)"
 
     if [ $? -eq 0 ] && [ -n "${_AIO_MEM_INPUT}" ]; then
         if [[ "${_AIO_MEM_INPUT}" =~ ^[0-9]+$ ]] && [ "${_AIO_MEM_INPUT}" -gt 0 ]; then
@@ -8446,7 +8446,7 @@ step_11_sensor_deploy() {
   local sensor_mem_gb="${default_sensor_mem_gb}"
   local _SENSOR_MEM_INPUT
   local mem_input_rc
-  _SENSOR_MEM_INPUT="$(whiptail_inputbox "STEP 11 - Sensor (MDS) memory" "Enter memory (GB) for Sensor VM (mds).\n\nTotal memory: ${total_mem_gb}GB\nHost reserve (12%): ${host_reserve_gb}GB\nAvailable: ${available_mem_gb}GB\nDefault value: ${default_sensor_mem_gb}GB (30% of available)\nExample: Enter 32" "${default_sensor_mem_gb}" 14 80)"
+  _SENSOR_MEM_INPUT="$(whiptail_inputbox "STEP 11 - Sensor (MDS) memory" "Enter memory (GB) for Sensor VM (mds).\n\nTotal memory: ${total_mem_gb}GB\nHost reserve (12%): ${host_reserve_gb}GB\nAvailable: ${available_mem_gb}GB\nDefault value: ${default_sensor_mem_gb}GB (30% baseline, capped by NUMA1 when applicable)\nNUMA1 safe limit: ${numa1_mem_limit_gb:-N/A}GB\nExample: Enter ${default_sensor_mem_gb}" "${default_sensor_mem_gb}" 14 80)"
   mem_input_rc=$?
 
   if [ ${mem_input_rc} -ne 0 ]; then
