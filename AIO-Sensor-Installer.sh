@@ -729,6 +729,17 @@ numa_apply_vm_policy() {
   log "[NUMA] ${vm}: ${max_vcpus} vCPUs pinned to NUMA${node}, emulatorpin=${cpus}, memory mode=strict nodeset=${node} (--config)"
   return 0
 }
+# Confirm the persistent libvirt policy, rather than considering cputune alone a
+# complete NUMA configuration. virsh reports 'numa_mode' and 'numa_nodeset'.
+numa_check_vm_memory_policy() {
+  local vm="${1:-}" node="${2:-}" status=""
+  status=$(virsh numatune "${vm}" --config 2>/dev/null) || return 1
+  printf '%s\n' "${status}" | awk -F: -v node="${node}" '
+    /numa_mode/ {gsub(/[[:space:]]/, "", $2); mode=$2}
+    /numa_nodeset/ {gsub(/[[:space:]]/, "", $2); nodes=$2}
+    END {exit !(mode=="strict" && nodes==node)}
+  '
+}
 # END NUMA HELPERS
 
 # Keep the original 545GiB AIO root LV unchanged. When the existing Ubuntu VG
@@ -11081,6 +11092,22 @@ build_validation_summary() {
     warn_msgs+=("mds VM XML does not have CPU pinning (cputune) configuration.")
     warn_msgs+=("  → ACTION: Re-run STEP 12 (PCI Passthrough / CPU Affinity)")
     warn_msgs+=("  → NOTE: NUMA1-based vCPU placement may not be applied without this")
+  fi
+
+  # Verify strict per-node guest memory placement, not just vCPU pinning.
+  if [[ "$(numa_node_count)" -gt 1 ]]; then
+    if numa_check_vm_memory_policy aio 0; then
+      ok_msgs+=("aio NUMA memory policy: strict, host nodeset 0")
+    else
+      warn_msgs+=("aio NUMA memory binding is absent or not strict on node 0.")
+      warn_msgs+=("  → ACTION: Re-run STEP 12 (CPU/NUMA affinity)")
+    fi
+    if numa_check_vm_memory_policy mds 1; then
+      ok_msgs+=("mds NUMA memory policy: strict, host nodeset 1")
+    else
+      warn_msgs+=("mds NUMA memory binding is absent or not strict on node 1.")
+      warn_msgs+=("  → ACTION: Re-run STEP 12 (CPU/NUMA affinity)")
+    fi
   fi
 
   ###############################
