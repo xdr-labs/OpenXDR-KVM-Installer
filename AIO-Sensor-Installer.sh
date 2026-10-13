@@ -570,6 +570,44 @@ get_qcow2_virtual_size_bytes() {
   printf '%s\n' "${virtual_bytes}"
 }
 
+# Keep the original 545GiB AIO root LV unchanged. When the existing Ubuntu VG
+# cannot also fit the legacy 400GiB Sensor LV, use its real free capacity with
+# 5GiB left unallocated. Never grow the Ubuntu root filesystem to make space.
+sensor_recommended_lv_gb() {
+  local vg_available_gb="${1:-}"
+  [[ "${vg_available_gb}" =~ ^[0-9]+$ ]] || return 1
+  local sensor_gb=$((vg_available_gb - 5))
+  (( sensor_gb > 400 )) && sensor_gb=400
+  # 80GiB minimum guest disk plus 30GiB host-filesystem headroom.
+  (( sensor_gb >= 110 )) || return 1
+  printf '%s\n' "${sensor_gb}"
+}
+
+sensor_recommended_disk_gb() {
+  local sensor_lv_gb="${1:-}"
+  [[ "${sensor_lv_gb}" =~ ^[0-9]+$ ]] || return 1
+  local disk_gb=$((sensor_lv_gb - 30))
+  (( disk_gb > 350 )) && disk_gb=350
+  (( disk_gb >= 80 )) || return 1
+  printf '%s\n' "${disk_gb}"
+}
+
+# LVM --nosuffix can still prefix rounded numbers with '<'. Parse these as
+# numbers instead of interpreting valid VG free space as zero.
+lvm_floor_units() {
+  awk 'NF {gsub(/[^0-9.]/, "", $1); if ($1 != "") {printf "%d\n", $1; exit}}'
+}
+
+# Debian-style disks use sda1; Linux NVMe/MMC disks use nvme0n1p1.
+disk_first_partition_path() {
+  local disk="${1#/dev/}"
+  [[ "${disk}" =~ ^[a-zA-Z0-9_-]+$ ]] || return 1
+  case "${disk}" in
+    *[0-9]) printf '/dev/%sp1\n' "${disk}" ;;
+    *)      printf '/dev/%s1\n' "${disk}" ;;
+  esac
+}
+
 # Expand ubuntu-vg from unallocated OS disk space when free extents are insufficient.
 # Args: step_label ubuntu_vg root_dev required_lv_mib [safety_buffer_mib]
 ensure_ubuntu_vg_free_space() {
@@ -581,7 +619,7 @@ ensure_ubuntu_vg_free_space() {
 
   local vg_free_mib
   vg_free_mib=$(sudo vgs --noheadings --units m --nosuffix -o vg_free "${ubuntu_vg}" 2>/dev/null \
-    | awk 'NF {print int($1); exit}')
+    | lvm_floor_units)
   [[ -z "${vg_free_mib}" ]] && vg_free_mib=0
 
   if [[ "${vg_free_mib}" -ge "${required_lv_mib}" ]]; then
@@ -675,7 +713,7 @@ ensure_ubuntu_vg_free_space() {
   run_cmd "sudo vgextend ${ubuntu_vg} ${new_os_pv_partition}"
 
   vg_free_mib=$(sudo vgs --noheadings --units m --nosuffix -o vg_free "${ubuntu_vg}" 2>/dev/null \
-    | awk 'NF {print int($1); exit}')
+    | lvm_floor_units)
   [[ -z "${vg_free_mib}" ]] && vg_free_mib=0
   if [[ "${vg_free_mib}" -lt "${required_lv_mib}" ]]; then
     log "[ERROR] ${ubuntu_vg} free space is still insufficient after vgextend (${vg_free_mib}MiB < ${required_lv_mib}MiB)."
@@ -7321,26 +7359,45 @@ step_10_sensor_lv_download() {
   # its extents are returned to the VG before the new LV is created.
   local ubuntu_vg_free_size available_gb existing_lv_size_gb effective_available_gb
   ubuntu_vg_free_size=$(vgs "${UBUNTU_VG}" --noheadings --units g --nosuffix -o vg_free 2>/dev/null | tr -d ' ' || echo "0")
-  available_gb=${ubuntu_vg_free_size%.*}
+  available_gb=$(printf '%s\n' "${ubuntu_vg_free_size}" | lvm_floor_units)
   [[ "${available_gb}" =~ ^[0-9]+$ ]] || available_gb=0
   [[ ${available_gb} -lt 0 ]] && available_gb=0
 
   existing_lv_size_gb=0
   if lvs "${lv_path_mds}" >/dev/null 2>&1; then
-    existing_lv_size_gb=$(lvs --noheadings --units g --nosuffix -o lv_size "${lv_path_mds}" 2>/dev/null       | awk 'NF {printf "%d", ($1 == int($1) ? $1 : int($1) + 1); exit}')
+    existing_lv_size_gb=$(lvs --noheadings --units g --nosuffix -o lv_size "${lv_path_mds}" 2>/dev/null       | awk 'NF {gsub(/[^0-9.]/, "", $1); printf "%d", ($1 == int($1) ? $1 : int($1) + 1); exit}')
     [[ "${existing_lv_size_gb}" =~ ^[0-9]+$ ]] || existing_lv_size_gb=0
   fi
   effective_available_gb=$((available_gb + existing_lv_size_gb))
   
-  # Default host LV size. Keep free space above the Sensor VM virtual disk.
+  # Keep the previous 400GiB default on hosts with sufficient space.
+  # When AIO's fixed 545GiB LV leaves less, size ONLY the Sensor LV.
   local default_sensor_lv_gb=400
-  
+  local capacity_limited_sensor_lv=0
+  local max_sensor_lv_gb=""
+  if (( effective_available_gb < 405 )); then
+    capacity_limited_sensor_lv=1
+    max_sensor_lv_gb=$(sensor_recommended_lv_gb "${effective_available_gb}" || true)
+    if [[ -z "${max_sensor_lv_gb}" ]]; then
+      log "[ERROR] Not enough VG space for a Sensor LV with guest-disk headroom (free after existing Sensor LV release=${effective_available_gb}GiB)."
+      whiptail_msgbox "STEP 10 - Insufficient VG Space" "The existing ubuntu-vg cannot fit both AIO and a viable Sensor LV.\nDo not expand the Ubuntu root filesystem.\nFree (including existing Sensor LV): ${effective_available_gb}GiB" 14 85
+      return 1
+    fi
+    default_sensor_lv_gb="${max_sensor_lv_gb}"
+    log "[STEP 10] Capacity-limited Sensor LV: ${default_sensor_lv_gb}GiB (AIO LV remains 545GiB, VG reserve 5GiB)."
+  fi
+  local input_sensor_lv_gb="${SENSOR_LV_SIZE_GB_PER_VM:-${default_sensor_lv_gb}}"
+  if [[ ! "${input_sensor_lv_gb}" =~ ^[0-9]+$ ]] || \
+     { (( capacity_limited_sensor_lv == 1 )) && (( input_sensor_lv_gb > max_sensor_lv_gb )); }; then
+    input_sensor_lv_gb="${default_sensor_lv_gb}"
+  fi
+
   # Prompt for LV size
   local lv_size_gb
   while true; do
     lv_size_gb=$(whiptail_inputbox "STEP 10 - Sensor (MDS) Storage Size Configuration" \
-                         "Please enter the storage size (GB) for the sensor VM (mds).\n\n- LV location: ${UBUNTU_VG} (OpenXDR method)\n- Current VG free space: ${available_gb}GB\n- Existing Sensor LV size: ${existing_lv_size_gb}GB\n- Available after deleting existing Sensor LV: ${effective_available_gb}GB\n- Minimum size: 80GB\n- Default value: ${default_sensor_lv_gb}GB\n\nExample: Enter 400\n\nSize (GB):" \
-                         "${SENSOR_LV_SIZE_GB_PER_VM:-${default_sensor_lv_gb}}" \
+                         "Please enter the storage size (GB) for the sensor VM (mds).\n\n- LV location: ${UBUNTU_VG} (OpenXDR method)\n- Current VG free space: ${available_gb}GB\n- Existing Sensor LV size: ${existing_lv_size_gb}GB\n- Available after deleting existing Sensor LV: ${effective_available_gb}GB\n- Minimum size: 80GB\n- Default value: ${default_sensor_lv_gb}GB\n- Space-limited maximum (if applicable): ${max_sensor_lv_gb:-not limited}GB\n\nExample: Enter ${default_sensor_lv_gb}\n\nSize (GB):" \
+                         "${input_sensor_lv_gb}" \
                          18 80) || {
       log "User canceled sensor storage size configuration."
       return 1
@@ -7357,6 +7414,10 @@ step_10_sensor_lv_download() {
     # Minimum size validation (80GB)
     if [[ "${lv_size_gb}" -lt 80 ]]; then
       whiptail_msgbox "Insufficient Size" "Minimum 80GB must be greater than or equal to.\nInput value: ${lv_size_gb}GB"
+      continue
+    fi
+    if (( capacity_limited_sensor_lv == 1 )) && (( lv_size_gb > max_sensor_lv_gb )); then
+      whiptail_msgbox "Insufficient VG Space" "AIO retains 545GiB. The Sensor LV can be at most ${max_sensor_lv_gb}GiB with a 5GiB Ubuntu VG reserve.\nInput: ${lv_size_gb}GiB\nEnter a smaller Sensor size." 15 85
       continue
     fi
 
@@ -7694,7 +7755,7 @@ step_10_sensor_lv_download() {
     # canceled, align defaults used by STEP 11 with the actual existing LV.
     local actual_existing_lv_gb
     actual_existing_lv_gb=$(sudo lvs --noheadings --units g --nosuffix -o lv_size "${lv_path_mds}" 2>/dev/null \
-      | awk 'NF {printf "%d", ($1 == int($1) ? $1 : int($1) + 1); exit}')
+      | awk 'NF {gsub(/[^0-9.]/, "", $1); printf "%d", ($1 == int($1) ? $1 : int($1) + 1); exit}')
     if [[ ! "${actual_existing_lv_gb}" =~ ^[0-9]+$ || "${actual_existing_lv_gb}" -lt 1 ]]; then
       log "[ERROR] Could not determine the existing Sensor LV size after keeping it."
       return 1
@@ -8120,8 +8181,32 @@ step_11_sensor_deploy() {
     [[ ${default_sensor_vcpus} -lt 2 ]] && default_sensor_vcpus=2
   fi
   
+  # Leave the previous 350GiB Sensor VM default alone on a 400GiB LV.
+  # Only a smaller Sensor host LV requires a smaller guest disk.
   local default_sensor_disk_gb=350
-  
+  local sensor_host_lv_gb=""
+  local capacity_limited_sensor_disk=0
+  if [[ "${DRY_RUN}" -eq 0 ]]; then
+    sensor_host_lv_gb=$(sudo lvs --noheadings --units g --nosuffix -o lv_size "${LV_LOCATION:-ubuntu-vg}/lv_sensor_root_mds" 2>/dev/null | lvm_floor_units || true)
+  fi
+  if [[ -z "${sensor_host_lv_gb}" && "${SENSOR_LV_SIZE_GB_PER_VM:-}" =~ ^[0-9]+$ ]]; then
+    sensor_host_lv_gb="${SENSOR_LV_SIZE_GB_PER_VM}"
+  fi
+  if [[ "${sensor_host_lv_gb}" =~ ^[0-9]+$ ]] && (( sensor_host_lv_gb < 380 )); then
+    capacity_limited_sensor_disk=1
+    default_sensor_disk_gb=$(sensor_recommended_disk_gb "${sensor_host_lv_gb}" || true)
+    if [[ -z "${default_sensor_disk_gb}" ]]; then
+      log "[ERROR] Sensor LV (${sensor_host_lv_gb}GiB) is too small for an 80GiB guest disk plus 30GiB host filesystem headroom."
+      return 1
+    fi
+    log "[STEP 11] Capacity-limited Sensor VM disk: ${default_sensor_disk_gb}GiB (host LV=${sensor_host_lv_gb}GiB)."
+  fi
+  local input_sensor_disk_gb="${SENSOR_DISK_SIZE_GB:-${default_sensor_disk_gb}}"
+  if [[ ! "${input_sensor_disk_gb}" =~ ^[0-9]+$ ]] || \
+     { (( capacity_limited_sensor_disk == 1 )) && (( input_sensor_disk_gb > default_sensor_disk_gb )); }; then
+    input_sensor_disk_gb="${default_sensor_disk_gb}"
+  fi
+
   # Use existing values if set, otherwise use calculated defaults
   : "${SENSOR_MEMORY_MB:=}"
   : "${SENSOR_VCPUS:=}"
@@ -8188,7 +8273,7 @@ step_11_sensor_deploy() {
   # 3) Disk size
   local _SENSOR_DISK_INPUT
   local disk_input_rc
-  _SENSOR_DISK_INPUT="$(whiptail_inputbox "STEP 11 - Sensor (MDS) disk" "Enter disk size (GB) for Sensor VM (mds).\n\nThis virtual disk is intentionally smaller than the host Sensor LV to preserve host filesystem headroom.\nMinimum size: 80GB\nDefault value: ${default_sensor_disk_gb}GB\nExample: Enter 350" "${SENSOR_DISK_SIZE_GB:-${default_sensor_disk_gb}}" 14 80)"
+  _SENSOR_DISK_INPUT="$(whiptail_inputbox "STEP 11 - Sensor (MDS) disk" "Enter disk size (GB) for Sensor VM (mds).\n\nThis virtual disk is intentionally smaller than the host Sensor LV to preserve host filesystem headroom.\nMinimum size: 80GB\nDefault value: ${default_sensor_disk_gb}GB\nExample: Enter ${default_sensor_disk_gb}" "${input_sensor_disk_gb}" 14 80)"
   disk_input_rc=$?
 
   local sensor_disk_gb
@@ -8213,6 +8298,11 @@ step_11_sensor_deploy() {
   else
     # Empty input - use default
     sensor_disk_gb="${default_sensor_disk_gb}"
+  fi
+
+  if (( capacity_limited_sensor_disk == 1 )) && (( sensor_disk_gb > default_sensor_disk_gb )); then
+    whiptail_msgbox "STEP 11 - Insufficient Sensor LV" "Sensor VM disk ${sensor_disk_gb}GiB would exceed the safe ${default_sensor_disk_gb}GiB capacity of the ${sensor_host_lv_gb}GiB Sensor LV.\nKeep at least 30GiB of host filesystem headroom." 15 85
+    return 1
   fi
 
   # Convert memory to MB
@@ -8243,7 +8333,7 @@ step_11_sensor_deploy() {
       return 1
     fi
 
-    sensor_lv_bytes=$(sudo lvs --noheadings --units b --nosuffix -o lv_size ubuntu-vg/lv_sensor_root_mds 2>/dev/null       | awk 'NF {printf "%.0f\n", $1; exit}')
+    sensor_lv_bytes=$(sudo lvs --noheadings --units b --nosuffix -o lv_size ubuntu-vg/lv_sensor_root_mds 2>/dev/null       | awk 'NF {gsub(/[^0-9.]/, "", $1); printf "%.0f\n", $1; exit}')
     if [[ ! "${sensor_lv_bytes}" =~ ^[0-9]+$ ]]; then
       log "[ERROR] Could not determine Sensor LV size for STEP 11 preflight."
       return 1
