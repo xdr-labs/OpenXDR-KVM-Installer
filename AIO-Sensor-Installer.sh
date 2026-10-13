@@ -570,6 +570,167 @@ get_qcow2_virtual_size_bytes() {
   printf '%s\n' "${virtual_bytes}"
 }
 
+# BEGIN NUMA HELPERS
+# The installer is a standalone file: keep these helpers inline. Parse the
+# machine-readable topology; the human '0-23,48-71' form is not an array.
+numa_expand_cpu_list() {
+  local spec="${1//[[:space:]]/}"
+  [[ -n "${spec}" ]] || return 1
+  awk -v spec="${spec}" 'BEGIN {
+    n=split(spec, chunks, ",")
+    for (i=1; i<=n; i++) {
+      if (chunks[i] !~ /^[0-9]+(-[0-9]+)?$/) exit 1
+      split(chunks[i], bounds, "-")
+      first=bounds[1]+0
+      last=(bounds[2]=="" ? first : bounds[2]+0)
+      if (first>last || last>65535 || last-first>4096) exit 1
+      for (j=first; j<=last; j++) print j
+    }
+  }' | LC_ALL=C sort -nu | paste -sd ',' -
+}
+
+# Return every online physical CPU ID belonging to one NUMA node, as CSV.
+numa_node_cpu_list() {
+  local node="${1:-}" topology="" csv="" cpu_file=""
+  [[ "${node}" =~ ^[0-9]+$ ]] || return 1
+  if command -v lscpu >/dev/null 2>&1; then
+    if topology=$(LC_ALL=C lscpu -p=CPU,NODE,ONLINE 2>/dev/null); then
+      csv=$(printf '%s\n' "${topology}" | awk -F, -v node="${node}" \
+        '$1 ~ /^[0-9]+$/ && $2 == node && toupper($3) ~ /^(Y|YES|1)$/ {print $1}' \
+        | LC_ALL=C sort -nu | paste -sd ',' -)
+      [[ -n "${csv}" ]] || return 1
+      printf '%s\n' "${csv}"
+      return 0
+    fi
+  fi
+  # Fallback only if lscpu itself is unavailable/failed. A successful empty
+  # online-CPU list is not a reason to pin a powered-off CPU from sysfs.
+  cpu_file="${NUMA_SYSFS_ROOT:-/sys/devices/system/node}/node${node}/cpulist"
+  [[ -r "${cpu_file}" ]] || return 1
+  numa_expand_cpu_list "$(cat "${cpu_file}")"
+}
+
+numa_node_count() {
+  local topology="" count=""
+  if command -v lscpu >/dev/null 2>&1; then
+    if topology=$(LC_ALL=C lscpu -p=CPU,NODE,ONLINE 2>/dev/null); then
+      count=$(printf '%s\n' "${topology}" | awk -F, \
+        '$1 ~ /^[0-9]+$/ && $2 ~ /^[0-9]+$/ && toupper($3) ~ /^(Y|YES|1)$/ {seen[$2]=1}
+         END {for (n in seen) c++; print c+0}')
+      if [[ "${count}" =~ ^[0-9]+$ ]] && (( count > 0 )); then
+        printf '%s\n' "${count}"
+        return 0
+      fi
+    fi
+  fi
+  if [[ -d "${NUMA_SYSFS_ROOT:-/sys/devices/system/node}/node1" ]]; then
+    printf '2\n'
+  else
+    printf '1\n'
+  fi
+}
+
+numa_cpu_count() {
+  local csv="${1:-}"
+  [[ "${csv}" =~ ^[0-9]+(,[0-9]+)*$ ]] || return 1
+  awk -F, '{print NF}' <<< "${csv}"
+}
+
+numa_take_cpus() {
+  local csv="${1:-}" requested="${2:-}" i result=""
+  [[ "${csv}" =~ ^[0-9]+(,[0-9]+)*$ && "${requested}" =~ ^[1-9][0-9]*$ ]] || return 1
+  local -a cpus=()
+  IFS=, read -r -a cpus <<< "${csv}"
+  (( requested <= ${#cpus[@]} )) || return 1
+  for ((i=0; i<requested; i++)); do
+    [[ -z "${result}" ]] && result="${cpus[i]}" || result+=",${cpus[i]}"
+  done
+  printf '%s\n' "${result}"
+}
+
+# Permit up to 85% of a single node's RAM for its guest, reserving at least
+# 15% for the host, hypervisor and NUMA-local kernel allocations.
+numa_node_memory_limit_gib() {
+  local node="${1:-}" total_kib="" limit=""
+  [[ "${node}" =~ ^[0-9]+$ ]] || return 1
+  local node_meminfo="${NUMA_SYSFS_ROOT:-/sys/devices/system/node}/node${node}/meminfo"
+  [[ -r "${node_meminfo}" ]] || return 1
+  total_kib=$(awk -v node="${node}" '$1=="Node" && $2==node && $3=="MemTotal:" && $4 ~ /^[0-9]+$/ {print $4; exit}' "${node_meminfo}")
+  [[ "${total_kib}" =~ ^[0-9]+$ ]] || return 1
+  limit=$(( total_kib * 85 / 100 / 1048576 ))
+  (( limit >= 2 )) || return 1
+  printf '%s\n' "${limit}"
+}
+
+numa_validate_guest_request() {
+  local vm="${1:-}" node="${2:-}" vcpus="${3:-}" memory_gib="${4:-}"
+  local cpus="" cpu_count="" memory_limit=""
+  [[ "${vcpus}" =~ ^[1-9][0-9]*$ && "${memory_gib}" =~ ^[1-9][0-9]*$ ]] || {
+    log "[NUMA] Invalid vCPU/memory request for ${vm}: cpu=${vcpus}, memory=${memory_gib}GiB"
+    return 1
+  }
+  cpus=$(numa_node_cpu_list "${node}") || {
+    log "[NUMA] Cannot detect online CPUs on node ${node}; ${vm} binding blocked."
+    return 1
+  }
+  cpu_count=$(numa_cpu_count "${cpus}") || return 1
+  if (( vcpus > cpu_count )); then
+    log "[NUMA] ${vm}: requested ${vcpus} vCPUs exceeds ${cpu_count} online CPUs on node ${node}."
+    return 1
+  fi
+  memory_limit=$(numa_node_memory_limit_gib "${node}") || {
+    log "[NUMA] Cannot determine safe memory capacity on node ${node}; ${vm} binding blocked."
+    return 1
+  }
+  if (( memory_gib > memory_limit )); then
+    log "[NUMA] ${vm}: requested ${memory_gib}GiB exceeds NUMA${node} safe limit ${memory_limit}GiB (85% of local RAM)."
+    return 1
+  fi
+  return 0
+}
+
+# Persistent VM CPU and memory placement; STEP 12 restarts both guests so
+# --config applies to the next VM start. Fail rather than silently only pin
+# some vCPUs or leave the VM without its requested memory-node policy.
+numa_apply_vm_policy() {
+  local vm="${1:-}" node="${2:-}" cpus="" max_vcpus="" used_mem_kib="" memory_gib="" i=""
+  local -a pcpu=()
+  cpus=$(numa_node_cpu_list "${node}") || {
+    log "[NUMA] ${vm}: no online CPU list for node ${node}"
+    return 1
+  }
+  max_vcpus=$(virsh vcpucount "${vm}" --maximum --config 2>/dev/null | awk 'NF {print $1; exit}')
+  used_mem_kib=$(virsh dominfo "${vm}" 2>/dev/null | awk '$1=="Used" && $2=="memory:" && $3 ~ /^[0-9]+$/ {print $3; exit}')
+  if [[ ! "${used_mem_kib}" =~ ^[0-9]+$ || "${used_mem_kib}" -eq 0 ]]; then
+    log "[NUMA] ${vm}: cannot read configured guest memory; refusing incomplete binding."
+    return 1
+  fi
+  memory_gib=$(( (used_mem_kib + 1048575) / 1048576 ))
+  numa_validate_guest_request "${vm}" "${node}" "${max_vcpus}" "${memory_gib}" || return 1
+  IFS=, read -r -a pcpu <<< "${cpus}"
+  if [[ "${DRY_RUN:-1}" -eq 1 ]]; then
+    log "[DRY-RUN] ${vm}: vcpupin 0..$((max_vcpus-1)) => NUMA${node} cpus ${cpus}; emulatorpin ${cpus}; numatune --mode strict --nodeset ${node} (--config)"
+    return 0
+  fi
+  if ! virsh emulatorpin "${vm}" "${cpus}" --config >/dev/null 2>&1; then
+    log "[ERROR] ${vm}: NUMA${node} emulatorpin failed"
+    return 1
+  fi
+  for ((i=0; i<max_vcpus; i++)); do
+    if ! virsh vcpupin "${vm}" "${i}" "${pcpu[i]}" --config >/dev/null 2>&1; then
+      log "[ERROR] ${vm}: NUMA${node} pinning vCPU ${i} to pCPU ${pcpu[i]} failed"
+      return 1
+    fi
+  done
+  if ! virsh numatune "${vm}" --mode strict --nodeset "${node}" --config >/dev/null 2>&1; then
+    log "[ERROR] ${vm}: NUMA${node} strict memory policy failed"
+    return 1
+  fi
+  log "[NUMA] ${vm}: ${max_vcpus} vCPUs pinned to NUMA${node}, emulatorpin=${cpus}, memory mode=strict nodeset=${node} (--config)"
+  return 0
+}
+# END NUMA HELPERS
+
 # Keep the original 545GiB AIO root LV unchanged. When the existing Ubuntu VG
 # cannot also fit the legacy 400GiB Sensor LV, use its real free capacity with
 # 5GiB left unallocated. Never grow the Ubuntu root filesystem to make space.
